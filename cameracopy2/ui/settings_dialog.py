@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -42,6 +44,7 @@ from cameracopy2.core.log_messages import LogMessageType
 from cameracopy2.core.hash import hash_method_available
 from cameracopy2.core.metadata_diagnostics import diagnose_files, format_diagnostics_report
 from cameracopy2.core.naming import preview_destination
+from cameracopy2.core.report_export import REPORT_FIELDS
 from cameracopy2.core.source_paths import resolve_source_root
 from cameracopy2.models import (
     CameraCopyConfig,
@@ -49,6 +52,7 @@ from cameracopy2.models import (
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
+    ReportFormat,
     ThemeMode,
     VerificationMode,
     VolumeInfo,
@@ -288,6 +292,10 @@ class SettingsDialog(QDialog):
         self._build_copy_tab()
         self._build_device_tab()
         self._build_appearance_tab()
+        # Report must be built before Advanced: the advanced tab calls
+        # _update_application_preview(), which runs _config_from_controls()
+        # and therefore needs every control this tab creates.
+        self._build_report_tab()
         self._build_advanced_tab()
         self._refresh_inline_warnings()
 
@@ -1269,6 +1277,112 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(tab, "Advanced")
         self._update_application_preview()
 
+    def _build_report_tab(self) -> None:
+        tab, layout = _create_form_tab()
+
+        self.report_export_checkbox = QCheckBox(
+            "Export a report after each copy finishes"
+        )
+        self.report_export_checkbox.setChecked(self._config.reportexport)
+        layout.addFullRow(self.report_export_checkbox)
+        set_help_tooltip(
+            self.report_export_checkbox,
+            "Automatically write a report when a copy task finishes.",
+        )
+
+        self.report_format_combo = QComboBox()
+        self.report_format_combo.addItem(
+            "CSV — opens in Excel and most spreadsheet tools", "csv"
+        )
+        self.report_format_combo.addItem(
+            "HTML — a self-contained page that opens in any browser", "html"
+        )
+        self.report_format_combo.addItem(
+            "PDF — a formatted report for archiving or handing over", "pdf"
+        )
+        self._set_combo_by_data(self.report_format_combo, self._config.reportformat)
+        layout.addRow("Report format:", self.report_format_combo)
+        set_help_tooltip(
+            self.report_format_combo,
+            "Format used when a report is exported automatically. The Export report "
+            "button lets you pick a format each time.",
+        )
+
+        self.report_directory_edit = QLineEdit(self._config.reportdirectory)
+        report_browse_button = QPushButton("Browse…")
+        report_browse_button.clicked.connect(self._browse_report_directory)
+        report_folder_row = QHBoxLayout()
+        report_folder_row.addWidget(self.report_directory_edit, 1)
+        report_folder_row.addWidget(report_browse_button)
+        layout.addRow("Report folder:", report_folder_row)
+        set_form_row_tooltip(
+            layout,
+            self.report_directory_edit,
+            "Reports are written here automatically; leave empty to ask each time.",
+        )
+
+        fields_heading = QLabel("Report fields")
+        fields_heading.setStyleSheet("font-weight: 600;")
+        layout.addFullRow(fields_heading)
+
+        self.report_fields_list = QListWidget()
+        selected_fields = set(self._config.reportfields)
+        field_headers: list[str] = []
+        for field_key, header in REPORT_FIELDS:
+            item = QListWidgetItem(i18n.translate_text(header))
+            field_headers.append(header)
+            item.setData(Qt.ItemDataRole.UserRole, field_key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if field_key in selected_fields
+                else Qt.CheckState.Unchecked
+            )
+            self.report_fields_list.addItem(item)
+        self.report_fields_list.setProperty("_i18n_listitems", field_headers)
+        self.report_fields_list.setMaximumHeight(168)
+        self.report_fields_list.setMinimumHeight(120)
+        layout.addFullRow(self.report_fields_list)
+        set_help_tooltip(
+            self.report_fields_list,
+            "Choose which columns the exported report contains.",
+        )
+
+        self.report_include_summary_checkbox = QCheckBox("Include summary in the report")
+        self.report_include_summary_checkbox.setChecked(self._config.reportincludesummary)
+        layout.addFullRow(self.report_include_summary_checkbox)
+        set_help_tooltip(
+            self.report_include_summary_checkbox,
+            "Include the per-task summary in exported reports.",
+        )
+
+        self.report_include_log_checkbox = QCheckBox("Include log in the report")
+        self.report_include_log_checkbox.setChecked(self._config.reportincludelog)
+        layout.addFullRow(self.report_include_log_checkbox)
+        set_help_tooltip(
+            self.report_include_log_checkbox,
+            "Include the full copy log in exported reports.",
+        )
+
+        layout.finish()
+        self.tabs.addTab(tab, "Report")
+
+    def _browse_report_directory(self) -> None:
+        start = self.report_directory_edit.text().strip()
+        if not start:
+            start = str(Path.home() / "Documents")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose a report folder", start)
+        if chosen:
+            self.report_directory_edit.setText(chosen)
+
+    def _selected_report_fields(self) -> list[str]:
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self.report_fields_list.count())
+            if (item := self.report_fields_list.item(index)).checkState()
+            == Qt.CheckState.Checked
+        ]
+
     def _show_format_requirements_dialog(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Format requirements")
@@ -1631,6 +1745,14 @@ class SettingsDialog(QDialog):
             copylogwarningcolor=self.log_color_controls[LogMessageType.WARNING].value(),
             copylogerrorcolor=self.log_color_controls[LogMessageType.ERROR].value(),
             copylogbackgroundcolor=self.log_background_control.value(),
+            reportexport=self.report_export_checkbox.isChecked(),
+            reportformat=cast(
+                ReportFormat, str(self.report_format_combo.currentData() or "csv")
+            ),
+            reportdirectory=self.report_directory_edit.text().strip(),
+            reportfields=self._selected_report_fields(),
+            reportincludesummary=self.report_include_summary_checkbox.isChecked(),
+            reportincludelog=self.report_include_log_checkbox.isChecked(),
         )
 
     def _update_preview(self) -> None:

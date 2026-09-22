@@ -54,6 +54,23 @@ CopyMode = Literal[
 ]
 CollisionPolicy = Literal["skip", "overwrite", "rename", "ask"]
 RedundantWriteMode = Literal["parallel", "sequential"]
+ReportFormat = Literal["csv", "html", "pdf"]
+
+# Default column set for exported copy reports (see report_export.REPORT_FIELDS).
+DEFAULT_REPORT_FIELDS = [
+    "source",
+    "destination",
+    "status",
+    "size",
+    "bytes_written",
+    "verification",
+    "rating",
+    "timestamp",
+    "failure_reason",
+]
+
+# Every report column key a user may pick ("backups" is off by default).
+REPORT_FIELD_KEYS = frozenset([*DEFAULT_REPORT_FIELDS, "backups"])
 ThemeMode = Literal["system", "light", "dark"]
 LanguageMode = Literal["zh_CN", "en"]
 HashMethod = Literal["sha256", "xxhash64"]
@@ -150,6 +167,12 @@ class CameraCopyConfig:
     copylogwarningcolor: str | None = None
     copylogerrorcolor: str | None = None
     copylogbackgroundcolor: str | None = None
+    reportexport: bool = False
+    reportformat: ReportFormat = "csv"
+    reportdirectory: str = ""
+    reportfields: list[str] = field(default_factory=lambda: list(DEFAULT_REPORT_FIELDS))
+    reportincludesummary: bool = True
+    reportincludelog: bool = False
 
 
 @dataclass(slots=True)

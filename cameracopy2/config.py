@@ -12,11 +12,14 @@ from typing import Any, cast
 from .models import (
     CONFIG_VERSION,
     DEFAULT_INCLUDE_PATTERNS,
+    DEFAULT_REPORT_FIELDS,
+    REPORT_FIELD_KEYS,
     CameraCopyConfig,
     CollisionPolicy,
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
+    ReportFormat,
     ThemeMode,
     VerificationMode,
     VolumeMatch,
@@ -49,6 +52,7 @@ _ALLOWED_LANGUAGES = {"zh_CN", "en"}
 _ALLOWED_HASH_METHODS = {"sha256", "xxhash64"}
 _ALLOWED_VERIFICATION_MODES = {"per_file", "batch"}
 _ALLOWED_REDUNDANT_WRITE_MODES = {"parallel", "sequential"}
+_ALLOWED_REPORT_FORMATS = {"csv", "html", "pdf"}
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _ALLOWED_VOLUME_MATCH_METHODS = {
     "device_serial",
@@ -238,6 +242,14 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         copylogbackgroundcolor=_read_optional_color(
             data, "copylogbackgroundcolor", default.copylogbackgroundcolor
         ),
+        reportexport=_read_bool(data, "reportexport", default.reportexport),
+        reportformat=_read_report_format(data, default.reportformat),
+        reportdirectory=_read_str(data, "reportdirectory", default.reportdirectory),
+        reportfields=_read_report_fields(data, default.reportfields),
+        reportincludesummary=_read_bool(
+            data, "reportincludesummary", default.reportincludesummary
+        ),
+        reportincludelog=_read_bool(data, "reportincludelog", default.reportincludelog),
     )
 
 
@@ -348,6 +360,30 @@ def _read_redundant_write_mode(
     if not isinstance(value, str) or value not in _ALLOWED_REDUNDANT_WRITE_MODES:
         raise UnsupportedConfigError("redundantwritemode must be parallel or sequential.")
     return cast(RedundantWriteMode, value)
+
+
+def _read_report_format(data: dict[str, Any], default: ReportFormat) -> ReportFormat:
+    if "reportformat" not in data:
+        return default
+    value = data["reportformat"]
+    if not isinstance(value, str) or value not in _ALLOWED_REPORT_FORMATS:
+        raise UnsupportedConfigError("reportformat must be csv, html, or pdf.")
+    return cast(ReportFormat, value)
+
+
+def _read_report_fields(data: dict[str, Any], default: list[str]) -> list[str]:
+    """Read report column keys; unknown keys are dropped, empty falls back to defaults."""
+    if "reportfields" not in data:
+        return list(default)
+    values = _read_str_list(data, "reportfields", [])
+    result = [value for value in values if value in REPORT_FIELD_KEYS]
+    # Preserve the canonical column order instead of the stored order.
+    canonical = [
+        *DEFAULT_REPORT_FIELDS,
+        "backups",
+    ]
+    ordered = [key for key in canonical if key in result]
+    return ordered or list(default)
 
 
 def _read_volume_match(data: dict[str, Any], key: str, default: VolumeMatch) -> VolumeMatch:

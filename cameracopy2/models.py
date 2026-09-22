@@ -335,9 +335,12 @@ class FileCopyResult:
     @property
     def replicas_verified(self) -> bool:
         """True when every redundant destination holds a fresh or verified copy."""
-        return bool(self.replicas) and all(
-            not replica.failed and not replica.skipped for replica in self.replicas
-        )
+        return bool(self.replicas) and not self.replicas_incomplete
+
+    @property
+    def replicas_incomplete(self) -> bool:
+        """True when a configured mirror is missing, failed or was left behind."""
+        return any(replica.failed or replica.skipped for replica in self.replicas)
 
     @property
     def cancelled(self) -> bool:
@@ -554,6 +557,7 @@ class CopyReport:
             )
         if self.replica_results:
             lines.append(f"Redundant bytes written: {self.replica_bytes_copied:,}")
+            lines.extend(self.redundant_backup_lines())
         if self.copy_seconds is not None:
             if self.bytes_copied > 0 and self.copy_seconds > 0:
                 average_speed = _format_byte_speed(self.bytes_copied / self.copy_seconds)
@@ -573,6 +577,11 @@ class CopyReport:
     @property
     def replica_failed_count(self) -> int:
         return sum(1 for replica in self.replica_results if replica.failed)
+
+    @property
+    def replicas_verified_count(self) -> int:
+        """Files whose every redundant destination holds a fresh or verified copy."""
+        return sum(1 for result in self.results if result.replicas_verified)
 
     def redundant_backup_lines(self) -> list[str]:
         """Summarise one redundant-backup destination per line."""

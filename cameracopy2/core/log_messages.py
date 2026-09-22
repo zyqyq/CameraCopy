@@ -100,6 +100,9 @@ def classify_log_message(message: str) -> LogMessageType:
     ):
         return LogMessageType.CONFIRMED
 
+    if "REDUNDANT BACKUP INCOMPLETE" in upper:
+        return LogMessageType.WARNING
+
     if upper.startswith(
         (
             "COPIED:",

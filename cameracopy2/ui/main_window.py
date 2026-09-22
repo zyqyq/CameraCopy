@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,7 @@ from cameracopy2.services.volume_service import (
 from cameracopy2.ui.copy_progress_dialog import CopyProgressDialog
 from cameracopy2.ui.main_widgets import ElidedLabel, VolumeComboBox
 from cameracopy2.ui.settings_dialog import SettingsDialog
+from cameracopy2.ui.settings_widgets import folder_identity
 from cameracopy2.ui.theme import apply_theme
 from cameracopy2.ui.tooltips import (
     help_tooltip_text,
@@ -133,6 +135,7 @@ class MainWindow(QMainWindow):
         self.first_source_summary_label = ElidedLabel()
         self.second_source_summary_label = ElidedLabel()
         self.destination_summary_label = ElidedLabel()
+        self.redundant_summary_label = ElidedLabel()
         self.files_summary_label = ElidedLabel()
 
         self.refresh_button = QPushButton("Manual\nrescan")
@@ -270,6 +273,9 @@ class MainWindow(QMainWindow):
             self._summary_cell("Second source", self.second_source_summary_label), 1, 0
         )
         layout.addWidget(self._summary_cell("Files", self.files_summary_label), 1, 1)
+        layout.addWidget(
+            self._summary_cell("Backup copies", self.redundant_summary_label), 2, 0, 1, 2
+        )
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         return widget
@@ -540,7 +546,25 @@ class MainWindow(QMainWindow):
         self.destination_summary_label.set_full_text(
             str(Path(self.config.destination)) if self.config.destination else "Not configured"
         )
+        self.redundant_summary_label.set_full_text(self._redundant_summary_text())
         self.files_summary_label.set_full_text(self._files_summary_text())
+
+    def _redundant_summary_text(self) -> str:
+        if not self.config.redundantbackup:
+            return "Not enabled"
+        folders = [
+            str(folder).strip()
+            for folder in self.config.additionaldestinations
+            if str(folder).strip()
+        ]
+        if not folders:
+            return "No folder configured"
+        mode = (
+            "at the same time"
+            if self.config.redundantwritemode == "parallel"
+            else "one after another"
+        )
+        return f"{', '.join(folders)} ({mode})"
 
     def _source_summary_text(self, volume: object, none_text: str) -> str:
         if not isinstance(volume, VolumeInfo):
@@ -670,6 +694,12 @@ class MainWindow(QMainWindow):
                 f"{config.destination}\n\nReconnect it and try again, or start a new copy.",
             )
             return
+        if not self._ensure_redundant_folders_configured(config):
+            operation_log.warning(
+                "Resumed copy stopped: redundant backup folders are unavailable"
+            )
+            operation_log.close()
+            return
 
         volumes = [
             resumable.primary,
@@ -780,6 +810,10 @@ class MainWindow(QMainWindow):
             return
         if not self._ensure_destination_configured():
             operation_log.warning("Copy validation stopped: destination is unavailable")
+            operation_log.close()
+            return
+        if not self._ensure_redundant_folders_configured():
+            operation_log.warning("Copy validation stopped: backup folders are unavailable")
             operation_log.close()
             return
         if secondary is not None and volumes_refer_to_same_mounted_volume(primary, secondary):
@@ -1031,6 +1065,51 @@ class MainWindow(QMainWindow):
         save_config(self.config, self.config_path)
         self._update_summaries()
         return True
+
+    def _ensure_redundant_folders_configured(
+        self, config: CameraCopyConfig | None = None
+    ) -> bool:
+        """Refuse to start when a configured mirror root cannot be written to."""
+        config = config or self.config
+        if not config.redundantbackup:
+            return True
+        folders = [
+            str(folder).strip()
+            for folder in config.additionaldestinations
+            if str(folder).strip()
+        ]
+        if not folders:
+            QMessageBox.critical(
+                self,
+                "Backup folders unavailable",
+                "The redundant backup cannot start because no backup folder is "
+                "configured. Add one in Settings or turn the redundant backup off.",
+            )
+            return False
+
+        destination_identity = folder_identity(config.destination)
+        problems: list[str] = []
+        for folder in folders:
+            if folder_identity(folder) == destination_identity:
+                problems.append(f"{folder}\n    same folder as the destination")
+                continue
+            path = Path(folder).expanduser()
+            if not path.is_dir():
+                problems.append(f"{folder}\n    folder is not available")
+                continue
+            if not os.access(path, os.W_OK):
+                problems.append(f"{folder}\n    folder is not writable")
+        if not problems:
+            return True
+
+        QMessageBox.critical(
+            self,
+            "Backup folders unavailable",
+            "The redundant backup cannot start because at least one backup folder is "
+            "unusable. Reconnect the disk, choose another folder, or turn the "
+            "redundant backup off in Settings.\n\n" + "\n".join(problems),
+        )
+        return False
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         self._closing = True

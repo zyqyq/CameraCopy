@@ -6,6 +6,8 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QComboBox, QLabel, QSizePolicy, QWidget
 
+from cameracopy2 import i18n
+
 
 class ElidedLabel(QLabel):
     """Single-line label that preserves the full value in its tooltip."""
@@ -38,7 +40,12 @@ class ElidedLabel(QLabel):
     def _apply_elide(self) -> None:
         metrics = QFontMetrics(self.font())
         width = max(20, self.contentsRect().width())
-        self.setText(metrics.elidedText(self._full_text, Qt.TextElideMode.ElideRight, width))
+        # Elide the *localised* text: shortening the English source first hands
+        # the translation layer a string ending in an ellipsis, which no longer
+        # matches any entry, so the label would fall back to English.
+        shown = i18n.translate_text(self._full_text)
+        elided = metrics.elidedText(shown, Qt.TextElideMode.ElideRight, width)
+        i18n.set_display_text(self, self._full_text, elided)
 
 
 class VolumeComboBox(QComboBox):

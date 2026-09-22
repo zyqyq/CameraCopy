@@ -826,8 +826,10 @@ TRANSLATIONS: dict[str, str] = {
         "PDF — 适合存档或交付的排版报告",
     "Report folder:": "报告文件夹：",
     "Reports are written here automatically; leave empty to use "
-    "the top level of the destination folder.":
-        "自动导出的报告写入此处；留空则导出到目标文件夹的最高层级。",
+    "the topmost date folder of the destination (capture date or "
+    "today, following the folder tree mode).":
+        "自动导出的报告写入此处；留空则导出到目标文件夹最上层的日期文件夹"
+        "（拍摄日期或当前日期，随文件夹层级模式而定）。",
     "Choose a report folder": "选择报告文件夹",
     "Report fields:": "报告字段：",
     "Report fields": "报告字段",

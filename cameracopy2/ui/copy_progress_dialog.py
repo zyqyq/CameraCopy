@@ -874,7 +874,7 @@ class CopyProgressDialog(QDialog):
         if report is None:
             return
         config = self.job.config
-        directory = resolve_report_directory(config)
+        directory = resolve_report_directory(config, report)
         try:
             directory.mkdir(parents=True, exist_ok=True)
             suggested = build_export_path(directory, report, config.reportformat)
@@ -899,7 +899,7 @@ class CopyProgressDialog(QDialog):
         config = self.job.config
         if not config.reportexport or self.report is None:
             return
-        directory = resolve_report_directory(config)
+        directory = resolve_report_directory(config, self.report)
         try:
             directory.mkdir(parents=True, exist_ok=True)
             target = build_export_path(directory, self.report, config.reportformat)

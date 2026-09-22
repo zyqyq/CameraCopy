@@ -1461,7 +1461,8 @@ class SettingsDialog(QDialog):
             layout,
             self.report_directory_edit,
             "Reports are written here automatically; leave empty to use "
-            "the top level of the destination folder.",
+            "the topmost date folder of the destination (capture date or "
+            "today, following the folder tree mode).",
         )
 
         fields_heading = QLabel("Report fields")

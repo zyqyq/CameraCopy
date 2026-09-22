@@ -302,18 +302,37 @@ def default_report_directory() -> Path:
     return Path.home() / "Documents" / f"{APP_NAME} reports"
 
 
-def resolve_report_directory(config) -> Path:
+def resolve_report_directory(config, report: CopyReport | None = None) -> Path:
     """Return the folder reports should be written to.
 
     An explicit ``reportdirectory`` wins. Otherwise the report goes to the
-    top level of the copy destination — regardless of which folder tree
-    mode is active, sub-folders only organize the copied files, never the
-    report. Without a destination configured, fall back to Documents.
+    top level of the copy destination — the outermost folder created by the
+    folder tree mode: the capture-date folder in ``capture_date`` mode, the
+    today folder in ``today_nested`` / ``today_only`` mode. The level is
+    derived from the first file the task actually wrote, so prefixes,
+    postfixes and mixed capture dates all follow what really happened.
+    Files that were copied directly into the destination root keep the root.
+    Without a destination configured, fall back to Documents.
     """
     configured = config.reportdirectory.strip()
     if configured:
         return Path(configured).expanduser()
     destination = config.destination.strip()
-    if destination:
-        return Path(destination).expanduser()
-    return default_report_directory()
+    if not destination:
+        return default_report_directory()
+    destination_root = Path(destination).expanduser()
+    if report is not None:
+        for result in report.results:
+            output = result.destination
+            if output is None:
+                continue
+            try:
+                relative = output.resolve().relative_to(
+                    destination_root.resolve()
+                )
+            except ValueError:
+                continue
+            if len(relative.parts) > 1:
+                return destination_root / relative.parts[0]
+            return destination_root
+    return destination_root

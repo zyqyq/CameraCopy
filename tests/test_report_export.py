@@ -552,8 +552,86 @@ def test_resolve_report_directory_without_destination_falls_back(
     assert resolve_report_directory(config) == default_report_directory()
 
 
-def test_auto_export_writes_to_destination_top_level(qapp, tmp_path: Path) -> None:  # noqa: ARG001
+def _report_written_to(file_path: Path) -> CopyReport:
+    report = _make_report()
+    report.results.clear()
+    report.results.append(
+        FileCopyResult(
+            source=Path("/card/DCIM/DSC00001.NEF"),
+            destination=file_path,
+            action="copied",
+            copy_mode="copied",
+            hash_ok=True,
+            size_bytes=12_345,
+            bytes_copied=12_345,
+        )
+    )
+    return report
+
+
+def test_resolve_report_directory_follows_folder_tree_modes(
+    tmp_path: Path,
+) -> None:
+    """The report lands in the outermost date folder of the tree mode."""
+    from cameracopy2.core.report_export import resolve_report_directory
+
     dest = tmp_path / "pictures"
+
+    # capture_date: the capture-date folder is the topmost level.
+    capture_file = dest / "2026-09-20" / "DSC00001.NEF"
+    config = CameraCopyConfig(
+        source="", destination=str(dest), reportdirectory=""
+    )
+    assert (
+        resolve_report_directory(config, _report_written_to(capture_file))
+        == dest / "2026-09-20"
+    )
+
+    # today_nested: the today folder is the outermost level.
+    nested_file = dest / "2026-09-22" / "2026-09-20" / "DSC00001.NEF"
+    config = CameraCopyConfig(
+        source="",
+        destination=str(dest),
+        reportdirectory="",
+        foldertreemode="today_nested",
+    )
+    assert (
+        resolve_report_directory(config, _report_written_to(nested_file))
+        == dest / "2026-09-22"
+    )
+
+    # today_only: the today folder is the only level.
+    today_file = dest / "2026-09-22" / "DSC00001.NEF"
+    config = CameraCopyConfig(
+        source="",
+        destination=str(dest),
+        reportdirectory="",
+        foldertreemode="today_only",
+    )
+    assert (
+        resolve_report_directory(config, _report_written_to(today_file))
+        == dest / "2026-09-22"
+    )
+
+    # A file copied directly into the destination root keeps the root.
+    plain_file = dest / "DSC00001.NEF"
+    config = CameraCopyConfig(source="", destination=str(dest))
+    assert (
+        resolve_report_directory(config, _report_written_to(plain_file)) == dest
+    )
+
+    # Files written outside the destination are ignored: root fallback.
+    stranger = tmp_path / "elsewhere" / "DSC00001.NEF"
+    assert (
+        resolve_report_directory(config, _report_written_to(stranger)) == dest
+    )
+
+
+def test_auto_export_writes_into_destination_date_folder(
+    qapp, tmp_path: Path
+) -> None:  # noqa: ARG001
+    dest = tmp_path / "pictures"
+    date_folder = dest / "2026-09-22"
     config = CameraCopyConfig(
         source="",
         destination=str(dest),
@@ -571,12 +649,11 @@ def test_auto_export_writes_to_destination_top_level(qapp, tmp_path: Path) -> No
     from cameracopy2.ui.copy_progress_dialog import CopyProgressDialog
 
     dialog = CopyProgressDialog(job)
-    dialog.report = _make_report()
+    dialog.report = _report_written_to(date_folder / "DSC00001.NEF")
     dialog._finish_all_operations()  # noqa: SLF001
     dialog.close()
     qapp.processEvents()
 
-    reports = list(dest.glob("CameraCopy report *.csv"))
-    assert reports, "the report must land in the destination top level"
-    # 不落进任何按日期/层级组织的子文件夹
-    assert all(report.parent == dest for report in reports)
+    reports = list(date_folder.glob("CameraCopy report *.csv"))
+    assert reports, "the report must land in the topmost date folder"
+    assert all(report.parent == date_folder for report in reports)

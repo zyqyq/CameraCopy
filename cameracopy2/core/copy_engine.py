@@ -213,12 +213,22 @@ class SourceProgress:
         self.callbacks.emit_progress(self.item_index, self.total_items)
 
 
+def remove_source_file(source: Path) -> str | None:
+    """Delete one copied source file; return an error message on failure."""
+    try:
+        source.unlink()
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 class CopyEngine:
     def __init__(
         self,
         rating_reader: RatingReader | None = None,
         timestamp_resolver: TimestampResolver | None = None,
         session_store: CopySessionStore | None = None,
+        defer_source_removal: bool = False,
     ) -> None:
         self._batch_entries: list[BatchVerificationEntry] = []
         self._session_store = session_store
@@ -226,6 +236,8 @@ class CopyEngine:
         self._session_source_root: Path | None = None
         self._session_volume_key: str | None = None
         self._session_source_index = 0
+        self._defer_source_removal = defer_source_removal
+        self._report: CopyReport | None = None
         # Redundant-backup destinations for the job currently running.
         self._replica_roots: list[Path] = []
         # Parallel replicas share the copy journal, so partial-file bookkeeping
@@ -258,6 +270,7 @@ class CopyEngine:
         self._task_time = report.started_at
         report.hash_method = job.config.hashmethod
         report.verification_mode = job.config.verificationmode
+        self._report = report
         self._batch_entries = []
         self._session = None
         self._resume = job.resume
@@ -339,8 +352,16 @@ class CopyEngine:
                 report.cancelled = True
             report.finished_at = datetime.now()
             self._close_session(callbacks, report)
+            if self._defer_source_removal and report.pending_source_removals:
+                self._log(
+                    callbacks,
+                    report,
+                    "Source cleanup deferred: "
+                    f"{len(report.pending_source_removals)} file(s) awaiting confirmation.",
+                )
             for line in report.summary_lines():
                 report.add_log(line)
+        self._report = None
         return report
 
     # -- interrupted-job recovery ------------------------------------------
@@ -784,7 +805,14 @@ class CopyEngine:
         entry: BatchVerificationEntry,
     ) -> None:
         result = entry.result
-        remove_error = self._remove_source(entry.source)
+        remove_error = self._dispatch_removal(entry.source, entry.size_bytes)
+        if remove_error is None and self._defer_source_removal:
+            self._log(
+                callbacks,
+                report,
+                f"Source removal deferred until you confirm: {entry.source}",
+            )
+            return
         if remove_error is not None:
             result.action = "failed"
             result.copy_mode = None
@@ -1435,7 +1463,9 @@ class CopyEngine:
             if hash_result.ok:
                 action = "verified_existing"
                 if autoremove:
-                    remove_error = self._remove_source(context.source)
+                    remove_error = self._dispatch_removal(
+                        context.source, context.source_size
+                    )
                     if remove_error is not None:
                         return FileCopyResult(
                             source=context.source,
@@ -1447,7 +1477,8 @@ class CopyEngine:
                             size_bytes=context.source_size,
                             volume_mismatch=True,
                         )
-                    action = "removed"
+                    if not self._defer_source_removal:
+                        action = "removed"
                 return FileCopyResult(
                     source=context.source,
                     destination=context.destination,
@@ -2359,7 +2390,7 @@ class CopyEngine:
             )
 
         if remove_source:
-            remove_error = self._remove_source(source)
+            remove_error = self._dispatch_removal(source, source_size)
             if remove_error is not None:
                 return FileCopyResult(
                     source=source,
@@ -2372,7 +2403,7 @@ class CopyEngine:
                     bytes_copied=copy_result.bytes_copied,
                     copy_mode=copy_mode,
                 )
-            action = "removed"
+            action = "copied" if self._defer_source_removal else "removed"
         else:
             action = "copied"
 
@@ -2444,7 +2475,7 @@ class CopyEngine:
         autoremove: bool,
     ) -> FileCopyResult:
         if autoremove:
-            remove_error = self._remove_source(source)
+            remove_error = self._dispatch_removal(source, source_size)
             if remove_error is not None:
                 return FileCopyResult(
                     source=source,
@@ -2455,10 +2486,19 @@ class CopyEngine:
                     error=remove_error,
                     size_bytes=source_size,
                 )
+            if not self._defer_source_removal:
+                return FileCopyResult(
+                    source=source,
+                    destination=destination,
+                    action="removed",
+                    hash_ok=True,
+                    size_bytes=source_size,
+                    copy_mode="clone_verified",
+                )
             return FileCopyResult(
                 source=source,
                 destination=destination,
-                action="removed",
+                action="verified_existing",
                 hash_ok=True,
                 size_bytes=source_size,
                 copy_mode="clone_verified",
@@ -2702,7 +2742,7 @@ class CopyEngine:
             incomplete_reason = "redundant backup incomplete; source kept"
 
         if autoremove and not defer_removal and not replica_incomplete:
-            remove_error = self._remove_source(context.source)
+            remove_error = self._dispatch_removal(context.source, context.source_size)
             if remove_error is not None:
                 return FileCopyResult(
                     source=context.source,
@@ -2719,21 +2759,25 @@ class CopyEngine:
                     bytes_copied=bytes_copied,
                     replicas=replica_list,
                 )
-            return FileCopyResult(
-                source=context.source,
-                destination=destination,
-                action="removed",
-                hash_ok=hash_ok,
-                rating=context.rating,
-                timestamp=context.timestamp,
-                timestamp_source=context.timestamp_source,
-                rating_source=context.rating_source,
-                reason="source removed",
-                size_bytes=context.source_size,
-                bytes_copied=bytes_copied,
-                copy_mode=copy_mode,
-                replicas=replica_list,
-            )
+            if not self._defer_source_removal:
+                return FileCopyResult(
+                    source=context.source,
+                    destination=destination,
+                    action="removed",
+                    hash_ok=hash_ok,
+                    rating=context.rating,
+                    timestamp=context.timestamp,
+                    timestamp_source=context.timestamp_source,
+                    rating_source=context.rating_source,
+                    reason="source removed",
+                    size_bytes=context.source_size,
+                    bytes_copied=bytes_copied,
+                    copy_mode=copy_mode,
+                    replicas=replica_list,
+                )
+            # Deferred: the file was copied; its deletion waits for the
+            # user to confirm the prompt shown when the job finishes.
+            incomplete_reason = "source removal pending confirmation"
 
         return FileCopyResult(
             source=context.source,
@@ -3200,13 +3244,22 @@ class CopyEngine:
         except OSError as exc:
             logger.warning("Could not remove CameraCopy temporary file %s: %s", path, exc)
 
+    def _dispatch_removal(self, source: Path, size_bytes: int) -> str | None:
+        """Delete the source now, or park it for a confirmation prompt.
+
+        With ``defer_source_removal`` enabled (the GUI sets this), nothing is
+        deleted here: the file is recorded in the report and the copy window
+        asks the user once the job has finished.
+        """
+        if self._defer_source_removal:
+            if self._report is not None:
+                self._report.pending_source_removals.append((source, max(0, size_bytes)))
+            return None
+        return self._remove_source(source)
+
     @staticmethod
     def _remove_source(source: Path) -> str | None:
-        try:
-            source.unlink()
-        except OSError as exc:
-            return str(exc)
-        return None
+        return remove_source_file(source)
 
     @staticmethod
     def _source_progress_callback(

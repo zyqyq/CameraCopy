@@ -801,6 +801,13 @@ TRANSLATIONS: dict[str, str] = {
     "Interrupted copy stopped; it can be resumed later.":
         "中断的复制已停止，之后可以继续。",
     "Bytes continued from partial files": "断点续传已写入的字节",
+    # --- Source deletion confirmation --------------------------------------
+    "Confirm source deletion": "确认删除源文件",
+    "Delete source files": "删除源文件",
+    "Keep source files": "保留源文件",
+    "Deleted files cannot be recovered. Only files that were copied and "
+    "verified are affected. The copies on the destination stay.":
+        "删除后无法恢复。只有已复制并校验通过的文件会被删除，目标位置的副本不受影响。",
     # --- Report export -----------------------------------------------------
     "Report": "报告",
     "Export report": "导出报告",
@@ -1218,6 +1225,35 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
             f"占位符自由组合：{m.group(1)}。* 代表原始文件名，"
             f"例如「{m.group(2)}」会把原文件名放在日期后面。"
         ),
+    ),
+    # source deletion confirmation -------------------------------------------
+    (
+        r"^The copy finished successfully\. Delete (\d+) source file\(s\) "
+        r"\((.+)\) from the card\?$",
+        lambda m: f"复制已成功完成。要从存储卡删除 {m.group(1)} 个源文件"
+        f"（共 {m.group(2)}）吗？",
+    ),
+    (
+        r"^Deleted (\d+) source file\(s\) after confirmation "
+        r"\((.+)\)\. (\d+) file\(s\) could not be deleted\.$",
+        lambda m: f"已确认删除 {m.group(1)} 个源文件（共 {m.group(2)}），"
+        f"其中 {m.group(3)} 个删除失败。",
+    ),
+    (
+        r"^Deleted (\d+) source file\(s\) after confirmation \((.+)\)\.$",
+        lambda m: f"已确认删除 {m.group(1)} 个源文件（共 {m.group(2)}）。",
+    ),
+    (
+        r"^Kept (\d+) source file\(s\); deletion cancelled\.$",
+        lambda m: f"已保留 {m.group(1)} 个源文件；已取消删除。",
+    ),
+    (
+        r"^Source removal deferred until you confirm: (.+)$",
+        lambda m: f"已暂缓删除，等待确认：{m.group(1)}",
+    ),
+    (
+        r"^Source cleanup deferred: (\d+) file\(s\) awaiting confirmation\.$",
+        lambda m: f"源文件删除已暂缓：{m.group(1)} 个文件等待确认。",
     ),
 ]
 

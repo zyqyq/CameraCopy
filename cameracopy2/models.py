@@ -418,6 +418,11 @@ class CopyReport:
     resumed_bytes: int = 0
     partial_resume_count: int = 0
     resumed_partial_bytes: int = 0
+    # Source deletions that wait behind a confirmation prompt: (path, size).
+    pending_source_removals: list[tuple[Path, int]] = field(default_factory=list)
+    removal_confirmed: bool | None = None
+    confirmed_removals: int = 0
+    confirmed_removal_bytes: int = 0
 
     def add_log(self, message: str) -> None:
         self.logs.append(message)
@@ -595,6 +600,15 @@ class CopyReport:
                     f"{_format_elapsed_seconds(self.batch_verification_seconds)}"
                 )
         self._append_count_line(lines, self.removed_count, "source files removed")
+        if self.removal_confirmed is False and self.pending_source_removals:
+            lines.append(
+                f"Source files kept (deletion cancelled): "
+                f"{len(self.pending_source_removals)}"
+            )
+        elif self.removal_confirmed and self.confirmed_removals:
+            lines.append(
+                f"Source files removed after confirmation: {self.confirmed_removals}"
+            )
         self._append_count_line(lines, self.resumed_files, "already copied by an earlier run")
         self._append_count_line(lines, self.partial_resume_count, "continued from partial files")
         if self.rating_source_counts:

@@ -86,9 +86,12 @@ class CopyWorker(QObject):
                 clone_mismatch_decision=self.request_clone_mismatch_decision,
                 volume_mismatch_decision=self.request_volume_mismatch_decision,
             )
-            report = CopyEngine(session_store=self.session_store).run(
-                self.job, callbacks, self.cancel_event
-            )
+            report = CopyEngine(
+                session_store=self.session_store,
+                # The GUI never deletes without asking: the copy window shows
+                # a confirmation prompt once the job has finished.
+                defer_source_removal=True,
+            ).run(self.job, callbacks, self.cancel_event)
         except Exception as exc:  # noqa: BLE001 - convert worker failures into a report
             logger.exception("Unexpected copy-worker failure")
             report = self._internal_error_report(exc)

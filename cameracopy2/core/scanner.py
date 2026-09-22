@@ -55,3 +55,33 @@ def find_candidate_files(
         if "*" in include_patterns or _matches_any(name, include_patterns):
             candidates.append(path)
     return sorted(candidates, key=natural_path_key)
+
+
+def first_candidate_file(
+    source_root: Path,
+    include_patterns: list[str],
+    exclude_patterns: list[str] | None = None,
+) -> Path | None:
+    """Return the first file matching the include/exclude filters.
+
+    Stops at the first hit instead of walking the whole tree, so callers such
+    as the settings preview stay cheap on large cards. Returns ``None`` when
+    the directory is missing or nothing matches.
+    """
+    source_root = Path(source_root)
+    exclude_patterns = exclude_patterns or []
+    include_patterns = include_patterns or ["*"]
+    if not source_root.exists() or not source_root.is_dir():
+        return None
+    try:
+        for path in source_root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            name = path.name
+            if _matches_any(name, exclude_patterns):
+                continue
+            if "*" in include_patterns or _matches_any(name, include_patterns):
+                return path
+    except OSError:
+        return None
+    return None

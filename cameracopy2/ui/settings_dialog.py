@@ -51,6 +51,7 @@ from cameracopy2.core.naming import (
     rename_date_source_label,
 )
 from cameracopy2.core.source_paths import resolve_source_root
+from cameracopy2.core.scanner import first_candidate_file
 from cameracopy2.models import (
     CameraCopyConfig,
     CollisionPolicy,
@@ -314,6 +315,8 @@ class SettingsDialog(QDialog):
         self._config = config
         self._all_volumes = list(volumes or [])
         self._volumes = self._filter_volumes(self._config.includeddevices)
+        self._sample_cache_key: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
+        self._sample_cache_value: Path | None = None
 
         self.tabs = QTabWidget()
         self._build_source_tab()
@@ -1685,36 +1688,55 @@ class SettingsDialog(QDialog):
     def _update_preview(self) -> None:
         try:
             config = self._config_from_controls()
-            source_example = self._preview_source(config)
-            destination_example = preview_destination(config)
+            sample, sample_date = self._preview_sample(config)
+            destination_example = preview_destination(
+                config, sample_name=sample.name, timestamp=sample_date
+            )
             lines = [
-                f"Source example: {source_example}",
+                f"Source example: {sample}",
                 f"Destination example: {destination_example}",
             ]
-            rename_example = self._preview_rename(config, destination_example)
+            rename_example = self._preview_rename(
+                config, sample, sample_date, destination_example
+            )
             if rename_example:
                 lines.append(f"Rename example (when enabled): {rename_example}")
             self.preview_label.setText("\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             self.preview_label.setText(f"Preview unavailable: {exc}")
 
-    def _preview_rename(self, config: CameraCopyConfig, destination_example: str) -> str:
+    def _preview_rename(
+        self,
+        config: CameraCopyConfig,
+        sample: Path,
+        sample_date: datetime,
+        destination_example: str,
+    ) -> str:
         """Preview the built file name even while the switch on the main window is off."""
-        sample = Path(PREVIEW_FILE_NAME)
         try:
-            name = build_renamed_file_name(
-                config, sample, datetime.now().replace(microsecond=0)
-            )
+            name = build_renamed_file_name(config, sample, sample_date)
         except ValueError as exc:
             return f"unavailable — {exc}"
         if name == sample.name:
             return ""
         return str(Path(destination_example).parent / name)
 
-    def _preview_source(self, config: CameraCopyConfig) -> str:
-        preview_volume = self._preview_volume()
-        if preview_volume is not None:
-            source_root = resolve_source_root(preview_volume, config.source)
+    def _preview_sample(self, config: CameraCopyConfig) -> tuple[Path, datetime]:
+        """Pick the first real matching source file as the preview sample.
+
+        Falls back to the generic ``DSC0001.ARW`` sample (and the current
+        time) when no volume is selected, the source root is missing, or
+        nothing matches the include/exclude filters.
+        """
+        real = self._first_source_file(config)
+        if real is not None:
+            try:
+                return real, datetime.fromtimestamp(real.stat().st_mtime)
+            except OSError:
+                pass
+        volume = self._preview_volume()
+        if volume is not None:
+            source_root = resolve_source_root(volume, config.source)
         else:
             source_subfolder = normalize_source_subfolder(config.source)
             source_root = (
@@ -1722,7 +1744,29 @@ class SettingsDialog(QDialog):
                 if source_subfolder
                 else Path("/mounted/volume")
             )
-        return str(source_root / "DSC0001.ARW")
+        return (
+            source_root / PREVIEW_FILE_NAME,
+            datetime.now().replace(microsecond=0),
+        )
+
+    def _first_source_file(self, config: CameraCopyConfig) -> Path | None:
+        volume = self._preview_volume()
+        if volume is None:
+            return None
+        source_root = resolve_source_root(volume, config.source)
+        key = (
+            str(source_root),
+            tuple(config.includedfiles),
+            tuple(config.excludedfiles),
+        )
+        if self._sample_cache_key == key:
+            return self._sample_cache_value
+        found = first_candidate_file(
+            source_root, config.includedfiles, config.excludedfiles
+        )
+        self._sample_cache_key = key
+        self._sample_cache_value = found
+        return found
 
     def _preview_volume(self) -> VolumeInfo | None:
         if not self._volumes:

@@ -495,3 +495,105 @@ def test_main_window_checkbox_follows_and_drives_the_config(
     finally:
         window.close()
         gui_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Real-file preview sample
+# ---------------------------------------------------------------------------
+
+
+def test_first_candidate_file_stops_at_the_first_match(tmp_path: Path) -> None:
+    from cameracopy2.core.scanner import first_candidate_file
+
+    (tmp_path / "DCIM").mkdir()
+    (tmp_path / "DCIM" / "DJI0002.MP4").write_bytes(b"a")
+    (tmp_path / "DCIM" / "DJI0001.MP4").write_bytes(b"b")
+    (tmp_path / "DCIM" / "notes.txt").write_bytes(b"c")
+
+    found = first_candidate_file(tmp_path, ["*.MP4"], [])
+    assert found is not None and found.name in {"DJI0001.MP4", "DJI0002.MP4"}
+    assert first_candidate_file(tmp_path, ["*.JPG"], []) is None
+    assert first_candidate_file(tmp_path / "missing", ["*"]) is None
+    excluded = first_candidate_file(tmp_path, ["*"], ["*.txt", "*.MP4"])
+    assert excluded is None
+
+
+def test_settings_preview_uses_a_real_matching_file(
+    tmp_path: Path, gui_app, english_ui
+) -> None:
+    from cameracopy2.ui.settings_dialog import SettingsDialog
+
+    card = tmp_path / "card"
+    (card / "DCIM" / "100MSDCF").mkdir(parents=True)
+    real = card / "DCIM" / "100MSDCF" / "DJI0007.MP4"
+    real.write_bytes(b"video")
+    stamp = datetime(2024, 3, 4, 5, 6, 7).timestamp()
+    os.utime(real, ns=(int(stamp * 1e9), int(stamp * 1e9)))
+    (card / "DCIM" / "ignore.txt").write_bytes(b"x")
+
+    config = make_config(
+        tmp_path / "pictures",
+        includedfiles=["*.MP4"],
+        datetimestring="yyyy-MM-dd",
+        renamefiles=False,
+        renamefiledatestring="yyyyMMdd",
+        renamefilepattern="{date}-{name}",
+    )
+    dialog = SettingsDialog(config, volumes=[make_volume(card)])
+    try:
+        preview = dialog.preview_label.text()
+        lines = dict(
+            line.split(": ", 1) for line in preview.splitlines() if ": " in line
+        )
+        assert lines["Source example"] == str(real)
+        assert lines["Destination example"].endswith("/2024-03-04/DJI0007.MP4")
+        assert lines["Rename example (when enabled)"].endswith(
+            "/2024-03-04/20240304-DJI0007.MP4"
+        )
+    finally:
+        dialog.close()
+        gui_app.processEvents()
+
+
+def test_settings_preview_falls_back_without_matching_files(
+    tmp_path: Path, gui_app, english_ui
+) -> None:
+    from cameracopy2.ui.settings_dialog import SettingsDialog
+
+    card = tmp_path / "card"
+    card.mkdir()
+    (card / "readme.txt").write_bytes(b"x")
+
+    config = make_config(tmp_path / "pictures", includedfiles=["*.MP4"])
+    dialog = SettingsDialog(config, volumes=[make_volume(card)])
+    try:
+        preview = dialog.preview_label.text()
+        assert "Source example: " in preview
+        assert "DSC0001.ARW" in preview
+    finally:
+        dialog.close()
+        gui_app.processEvents()
+
+
+def test_settings_preview_sample_survives_repeated_updates(
+    tmp_path: Path, gui_app, english_ui
+) -> None:
+    from cameracopy2.ui.settings_dialog import SettingsDialog
+
+    card = tmp_path / "card"
+    card.mkdir()
+    real = card / "DJI0001.MP4"
+    real.write_bytes(b"video")
+
+    config = make_config(tmp_path / "pictures", includedfiles=["*.MP4"])
+    dialog = SettingsDialog(config, volumes=[make_volume(card)])
+    try:
+        first = dialog.preview_label.text()
+        dialog.rename_prefix_edit.setText("X_")
+        second = dialog.preview_label.text()
+        assert str(real) in first
+        assert str(real) in second
+        assert "X_" in second
+    finally:
+        dialog.close()
+        gui_app.processEvents()

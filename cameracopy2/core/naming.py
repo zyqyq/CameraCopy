@@ -183,8 +183,13 @@ def build_destination_file(
     return directory / build_renamed_file_name(config, source_file, rename_date)
 
 
-def preview_destination(config: CameraCopyConfig, sample_name: str = "DSC0001.ARW") -> str:
-    timestamp = datetime.now().replace(microsecond=0)
+def preview_destination(
+    config: CameraCopyConfig,
+    sample_name: str = "DSC0001.ARW",
+    *,
+    timestamp: datetime | None = None,
+) -> str:
+    timestamp = timestamp if timestamp is not None else datetime.now().replace(microsecond=0)
     directory = build_destination_directory(config, timestamp)
     if not config.renamefiles:
         return str(directory / sample_name)

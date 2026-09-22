@@ -9,20 +9,101 @@ from cameracopy2.config import (
     validate_file_stem,
     validate_folder_component,
 )
-from cameracopy2.models import CameraCopyConfig
+from cameracopy2.models import CameraCopyConfig, FolderTreeMode
 
 
-def build_destination_directory(config: CameraCopyConfig, timestamp: datetime) -> Path:
+#: Fallback pattern for the outer "today" folder when the user cleared the
+#: date format: an empty name would collapse the layer into the destination
+#: root, so a plain ISO date is used instead.
+DEFAULT_TODAY_FORMAT = "%Y-%m-%d"
+
+
+FOLDER_TREE_MODE_LABELS: dict[str, str] = {
+    "capture_date": "Capture date only",
+    "today_nested": "Today folder / capture date",
+    "today_only": "Today folder only",
+}
+
+
+#: Display order of the folder tree modes in the settings dialog.
+FOLDER_TREE_MODE_ORDER: tuple[FolderTreeMode, ...] = (
+    "capture_date",
+    "today_nested",
+    "today_only",
+)
+
+
+def folder_tree_mode(config: CameraCopyConfig) -> str:
+    """Normalized folder tree mode, tolerating configs written by older versions."""
+    value = str(getattr(config, "foldertreemode", "") or "")
+    return value if value in FOLDER_TREE_MODE_LABELS else "capture_date"
+
+
+def folder_tree_mode_label(mode: str) -> str:
+    return FOLDER_TREE_MODE_LABELS.get(str(mode or ""), str(mode or ""))
+
+
+def _validated_directory(parent: Path, name: str, *, layer: str) -> Path:
+    if not name:
+        return parent
+    validation_error = validate_folder_component(name)
+    if validation_error:
+        raise ValueError(f"Invalid destination folder name {name!r}: {validation_error}")
+    return parent / name
+
+
+def build_destination_directory(
+    config: CameraCopyConfig,
+    timestamp: datetime,
+    task_time: datetime | None = None,
+) -> Path:
+    """Destination directory for one media file.
+
+    ``timestamp`` is the per-file capture date from the timestamp priority
+    chain. ``task_time`` is the copy task's start time, captured once per run
+    so every file of the same task shares one "today" folder; it defaults to
+    now for previews and direct callers.
+
+    Depending on the folder tree mode the result is one of:
+
+    - ``capture_date``: ``root/<prefix+capture date+postfix>/`` (original)
+    - ``today_nested``: ``root/<today>/<prefix+capture date+postfix>/``
+    - ``today_only``: ``root/<prefix+today+postfix>/`` — one folder per task
+    """
     destination_root = Path(config.destination).expanduser()
     date_format = translate_datetime_format(config.datetimestring)
-    date_part = timestamp.strftime(date_format) if date_format else ""
-    folder_name = f"{config.folderprefix}{date_part}{config.folderpostfix}"
-    if not folder_name:
-        return destination_root
-    validation_error = validate_folder_component(folder_name)
-    if validation_error:
-        raise ValueError(f"Invalid destination folder name {folder_name!r}: {validation_error}")
-    return destination_root / folder_name
+    mode = folder_tree_mode(config)
+    task_time = task_time if task_time is not None else datetime.now()
+
+    def folder_name(prefix: str, moment: datetime, postfix: str) -> str:
+        date_part = moment.strftime(date_format) if date_format else ""
+        return f"{prefix}{date_part}{postfix}"
+
+    if mode == "today_only":
+        return _validated_directory(
+            destination_root,
+            folder_name(config.folderprefix, task_time, config.folderpostfix),
+            layer="today",
+        )
+
+    directory = _validated_directory(
+        destination_root,
+        folder_name(config.folderprefix, timestamp, config.folderpostfix),
+        layer="capture",
+    )
+    if mode != "today_nested":
+        return directory
+    # The today layer is the outermost one: today / capture date / file.
+    today_directory = _validated_directory(
+        destination_root,
+        task_time.strftime(date_format or DEFAULT_TODAY_FORMAT),
+        layer="today",
+    )
+    return _validated_directory(
+        today_directory,
+        folder_name(config.folderprefix, timestamp, config.folderpostfix),
+        layer="capture",
+    )
 
 
 def rename_date_format(config: CameraCopyConfig) -> str:
@@ -171,13 +252,15 @@ def build_destination_file(
     source_file: Path,
     timestamp: datetime,
     rename_date: datetime | None = None,
+    task_time: datetime | None = None,
 ) -> Path:
     """Destination of one media file.
 
     ``rename_date`` is supplied only while "rename files from metadata" is
-    active; without it the camera name is kept.
+    active; without it the camera name is kept. ``task_time`` is shared by
+    every file of one copy task (see :func:`build_destination_directory`).
     """
-    directory = build_destination_directory(config, timestamp)
+    directory = build_destination_directory(config, timestamp, task_time)
     if rename_date is None:
         return directory / source_file.name
     return directory / build_renamed_file_name(config, source_file, rename_date)
@@ -188,9 +271,11 @@ def preview_destination(
     sample_name: str = "DSC0001.ARW",
     *,
     timestamp: datetime | None = None,
+    task_time: datetime | None = None,
 ) -> str:
     timestamp = timestamp if timestamp is not None else datetime.now().replace(microsecond=0)
-    directory = build_destination_directory(config, timestamp)
+    task_time = task_time if task_time is not None else datetime.now().replace(microsecond=0)
+    directory = build_destination_directory(config, timestamp, task_time)
     if not config.renamefiles:
         return str(directory / sample_name)
     return str(directory / build_renamed_file_name(config, Path(sample_name), timestamp))

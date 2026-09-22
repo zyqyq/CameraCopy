@@ -17,6 +17,7 @@ from .models import (
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
+    FolderTreeMode,
     RenameDateSource,
     ThemeMode,
     VerificationMode,
@@ -180,6 +181,7 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         folderprefix=_read_str(data, "folderprefix", default.folderprefix),
         datetimestring=_read_str(data, "datetimestring", default.datetimestring),
         folderpostfix=_read_str(data, "folderpostfix", default.folderpostfix),
+        foldertreemode=_read_folder_tree_mode(data, default.foldertreemode),
         renamefiles=_read_bool(data, "renamefiles", default.renamefiles),
         renamefileprefix=_read_str(data, "renamefileprefix", default.renamefileprefix),
         renamefiledatestring=_read_str(
@@ -479,6 +481,24 @@ def _read_rename_date_source(
             "exif_create_date, quicktime_create_date, xmp_create_date or file_mtime."
         )
     return cast(RenameDateSource, value)
+
+
+_ALLOWED_FOLDER_TREE_MODES = frozenset(
+    {"capture_date", "today_nested", "today_only"}
+)
+
+
+def _read_folder_tree_mode(
+    data: dict[str, Any], default: FolderTreeMode
+) -> FolderTreeMode:
+    if "foldertreemode" not in data:
+        return default
+    value = data["foldertreemode"]
+    if not isinstance(value, str) or value not in _ALLOWED_FOLDER_TREE_MODES:
+        raise UnsupportedConfigError(
+            "foldertreemode must be capture_date, today_nested or today_only."
+        )
+    return cast(FolderTreeMode, value)
 
 
 def _read_optional_color(

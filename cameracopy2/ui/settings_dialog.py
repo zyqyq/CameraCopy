@@ -43,10 +43,13 @@ from cameracopy2.core.log_messages import LogMessageType
 from cameracopy2.core.hash import hash_method_available
 from cameracopy2.core.metadata_diagnostics import diagnose_files, format_diagnostics_report
 from cameracopy2.core.naming import (
+    FOLDER_TREE_MODE_ORDER,
     RENAME_DATE_SOURCE_ORDER,
     RENAME_PATTERN_DEFAULT,
     RENAME_PATTERN_TOKENS,
     build_renamed_file_name,
+    folder_tree_mode,
+    folder_tree_mode_label,
     preview_destination,
     rename_date_source_label,
 )
@@ -55,6 +58,7 @@ from cameracopy2.core.scanner import first_candidate_file
 from cameracopy2.models import (
     CameraCopyConfig,
     CollisionPolicy,
+    FolderTreeMode,
     HashMethod,
     LanguageMode,
     RenameDateSource,
@@ -492,6 +496,14 @@ class SettingsDialog(QDialog):
 
         self.prefix_edit = QLineEdit(self._config.folderprefix)
         self.postfix_edit = QLineEdit(self._config.folderpostfix)
+        self.folder_tree_combo = QComboBox()
+        for mode in FOLDER_TREE_MODE_ORDER:
+            self.folder_tree_combo.addItem(folder_tree_mode_label(mode), mode)
+        self.folder_tree_combo.setCurrentIndex(
+            _combo_index(
+                self.folder_tree_combo, folder_tree_mode(self._config)
+            )
+        )
         self.date_preset_combo = QComboBox()
         self.custom_date_edit = QLineEdit(self._config.datetimestring)
         for label, value in DATE_PRESETS:
@@ -502,6 +514,7 @@ class SettingsDialog(QDialog):
         self.custom_date_edit.setEnabled(self.date_preset_combo.currentData() is None)
 
         layout.addRow("Folder naming")
+        layout.addRow("Folder tree:", self.folder_tree_combo)
         layout.addRow("Folder prefix:", self.prefix_edit)
         layout.addRow("Date format:", self.date_preset_combo)
         layout.addRow("Custom date format:", self.custom_date_edit)
@@ -581,6 +594,16 @@ class SettingsDialog(QDialog):
             "CameraCopy displays all metadata ExifTool can read, together with the "
             "timestamp candidates and folder date CameraCopy would choose. Files and "
             "settings are not changed.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.folder_tree_combo,
+            "Choose how the destination folder tree is built.",
+            "Capture date only: one folder per capture date, as before. Today "
+            "folder / capture date: an extra folder named after the current "
+            "date wraps the capture-date folders. Today folder only: every "
+            "file of one copy task goes into a single folder named after the "
+            "current date.",
         )
         set_form_row_tooltip(
             layout,
@@ -1639,6 +1662,10 @@ class SettingsDialog(QDialog):
             folderprefix=self.prefix_edit.text(),
             datetimestring=date_format,
             folderpostfix=self.postfix_edit.text(),
+            foldertreemode=cast(
+                FolderTreeMode,
+                str(self.folder_tree_combo.currentData() or "capture_date"),
+            ),
             renamefiles=self._config.renamefiles,
             renamefileprefix=self.rename_prefix_edit.text(),
             renamefiledatestring=rename_date_format_value,

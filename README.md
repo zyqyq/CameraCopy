@@ -14,7 +14,9 @@ cleanup, and guarded post-copy formatting.<br>
 - Copy from one or two mounted volumes.
 - Dual-volume clone verification with mismatch handling.
 - Recursive scanning with configurable include and exclude patterns.
-- Date-based destination folders with configurable naming.
+- Date-based destination folders with configurable naming, plus two "today"
+  folder tree modes: wrap the capture-date folders in an extra current-date
+  folder, or put every file of one copy task into a single current-date folder.
 - Optional renaming of copied files from capture metadata, with a flexible
   `{token}` pattern (for example `{date}-{name}` turns `DJI0001.MP4` into
   `202601012000-DJI0001.MP4`; `*` keeps the original file name).

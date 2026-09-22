@@ -262,6 +262,19 @@ TRANSLATIONS: dict[str, str] = {
     "Browse…": "浏览…",
     "Choose source folder on volume": "选择卷上的源文件夹",
     # -- settings: folder naming -------------------------------------------
+    "Folder tree:": "文件夹层级：",
+    "Capture date only": "仅拍摄日期",
+    "Today folder / capture date": "当前日期/拍摄日期",
+    "Today folder only": "仅当前日期",
+    "Choose how the destination folder tree is built.":
+        "选择目标文件夹树的组织方式。",
+    "Capture date only: one folder per capture date, as before. Today folder "
+    "/ capture date: an extra folder named after the current date wraps the "
+    "capture-date folders. Today folder only: every file of one copy task "
+    "goes into a single folder named after the current date.":
+        "仅拍摄日期：与原来一样，每个拍摄日期一个文件夹。当前日期/拍摄日期："
+        "在最外层额外包一层以当前日期命名的文件夹。仅当前日期：同一次复制任务"
+        "的所有文件都放进同一个以当前日期命名的文件夹。",
     "Folder prefix:": "文件夹前缀：",
     "Date format:": "日期格式：",
     "Custom date format:": "自定义日期格式：",
@@ -991,6 +1004,10 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
         lambda m: f"继续 {m.group(1)} 中断的复制。",
     ),
     # Metadata-based file renaming
+    (
+        r"^Folder tree: (.+)$",
+        lambda m: f"文件夹层级：{TRANSLATIONS.get(m.group(1), m.group(1))}",
+    ),
     (
         r"^Rename files: (.+) \(date from (.+)\)$",
         lambda m: (

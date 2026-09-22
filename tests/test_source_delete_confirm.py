@@ -9,7 +9,18 @@ import pytest
 
 from cameracopy2 import i18n
 from cameracopy2.core.copy_engine import CopyEngine
-from cameracopy2.models import CameraCopyConfig, CopyJob, CopyReport, VolumeInfo
+from cameracopy2.core.report_export import report_rows
+from cameracopy2.models import (
+    SOURCE_REMOVAL_CANCELLED_REASON,
+    SOURCE_REMOVAL_FAILED_PREFIX,
+    SOURCE_REMOVAL_PENDING_REASON,
+    SOURCE_REMOVED_REASON,
+    CameraCopyConfig,
+    CopyJob,
+    CopyReport,
+    FileCopyResult,
+    VolumeInfo,
+)
 
 
 def make_volume(path: Path) -> VolumeInfo:
@@ -290,5 +301,138 @@ def test_deletion_messages_follow_language() -> None:
             i18n.translate_log("Source cleanup deferred: 4 file(s) awaiting confirmation.")
             == "源文件删除已暂缓：4 个文件等待确认。"
         )
+        assert i18n.translate_log("source removed") == "已删除源文件"
+        assert i18n.translate_log("source removal cancelled") == "已保留源文件"
+        assert (
+            i18n.translate_log("source removal failed: Permission denied")
+            == "删除源文件失败：Permission denied"
+        )
+    finally:
+        i18n.set_language("en")
+
+
+# ---------------------------------------------------------------------------
+# Report reasons must reflect the confirmed deletion outcome
+# ---------------------------------------------------------------------------
+
+
+def _report_with_pending(source: Path) -> CopyReport:
+    report = CopyReport(started_at=__import__("datetime").datetime.now())
+    report.pending_source_removals = [(source, 10)]
+    report.results = [
+        FileCopyResult(
+            source=source,
+            destination=None,
+            action="copied",
+            hash_ok=True,
+            reason=SOURCE_REMOVAL_PENDING_REASON,
+        )
+    ]
+    return report
+
+
+def test_resolve_source_removals_records_each_outcome(tmp_path: Path) -> None:
+    removed_file = tmp_path / "A.JPG"
+    stuck_file = tmp_path / "B.JPG"
+    removed = _report_with_pending(removed_file)
+    removed.results.append(
+        FileCopyResult(
+            source=stuck_file,
+            destination=None,
+            action="copied",
+            hash_ok=True,
+            reason=SOURCE_REMOVAL_PENDING_REASON,
+        )
+    )
+    removed.resolve_source_removals(
+        confirmed=True,
+        removed={removed_file},
+        failures={stuck_file: "Permission denied"},
+    )
+    assert removed.results[0].reason == SOURCE_REMOVED_REASON
+    assert removed.results[1].reason == f"{SOURCE_REMOVAL_FAILED_PREFIX}Permission denied"
+
+    cancelled = _report_with_pending(removed_file)
+    cancelled.resolve_source_removals(confirmed=False)
+    assert cancelled.results[0].reason == SOURCE_REMOVAL_CANCELLED_REASON
+
+    # Non-pending reasons are never touched.
+    untouched = _report_with_pending(removed_file)
+    untouched.results[0].reason = "copy cancelled"
+    untouched.resolve_source_removals(confirmed=False)
+    assert untouched.results[0].reason == "copy cancelled"
+
+
+def test_dialog_delete_updates_report_reason(
+    qapp, tmp_path: Path, fake_message_box
+) -> None:
+    i18n.set_language("en")
+    try:
+        source = tmp_path / "DSC0001.JPG"
+        source.write_bytes(b"image")
+        dialog = _dialog_with_pending(qapp, tmp_path, source)
+        dialog.report.results = [
+            FileCopyResult(
+                source=source,
+                destination=None,
+                action="copied",
+                hash_ok=True,
+                reason=SOURCE_REMOVAL_PENDING_REASON,
+            )
+        ]
+
+        dialog._finish_all_operations()  # noqa: SLF001
+        dialog.close()
+        qapp.processEvents()
+
+        assert dialog.report.results[0].reason == SOURCE_REMOVED_REASON
+        rows = report_rows(dialog.report, ["failure_reason"])
+        assert rows[1][0] == "source removed"
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+def test_dialog_keep_updates_report_reason(
+    qapp, tmp_path: Path, fake_message_box
+) -> None:
+    fake_message_box.chosen_text = "Keep source files"
+    i18n.set_language("en")
+    try:
+        source = tmp_path / "DSC0001.JPG"
+        source.write_bytes(b"image")
+        dialog = _dialog_with_pending(qapp, tmp_path, source)
+        dialog.report.results = [
+            FileCopyResult(
+                source=source,
+                destination=None,
+                action="copied",
+                hash_ok=True,
+                reason=SOURCE_REMOVAL_PENDING_REASON,
+            )
+        ]
+
+        dialog._finish_all_operations()  # noqa: SLF001
+        dialog.close()
+        qapp.processEvents()
+
+        assert dialog.report.results[0].reason == SOURCE_REMOVAL_CANCELLED_REASON
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
+def test_report_reason_column_follows_language(tmp_path: Path) -> None:
+    source = tmp_path / "DSC0001.JPG"
+    report = _report_with_pending(source)
+    report.resolve_source_removals(confirmed=False)
+
+    i18n.set_language("en")
+    try:
+        rows = report_rows(report, ["failure_reason"])
+        assert rows[1][0] == SOURCE_REMOVAL_CANCELLED_REASON
+    finally:
+        i18n.set_language("zh_CN")
+    try:
+        rows = report_rows(report, ["failure_reason"])
+        assert rows[1][0] == "已保留源文件"
     finally:
         i18n.set_language("en")

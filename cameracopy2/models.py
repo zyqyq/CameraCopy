@@ -341,6 +341,17 @@ class ReplicaResult:
         return self.copy_mode in {"copied", "overwrote", "renamed_copy"}
 
 
+#: Reason parked on copied files while a deferred source deletion waits for
+#: the confirmation prompt shown when the job finishes.
+SOURCE_REMOVAL_PENDING_REASON = "source removal pending confirmation"
+#: Reason recorded once a deferred source deletion was confirmed and done.
+SOURCE_REMOVED_REASON = "source removed"
+#: Reason recorded when the user declines the deletion prompt.
+SOURCE_REMOVAL_CANCELLED_REASON = "source removal cancelled"
+#: Prefix for reasons recorded when a confirmed deletion could not be done.
+SOURCE_REMOVAL_FAILED_PREFIX = "source removal failed: "
+
+
 @dataclass(slots=True)
 class FileCopyResult:
     source: Path
@@ -490,6 +501,36 @@ class CopyReport:
     @property
     def removed_count(self) -> int:
         return sum(1 for result in self.results if result.action == "removed")
+
+    def resolve_source_removals(
+        self,
+        *,
+        confirmed: bool,
+        removed: set[Path] | None = None,
+        failures: dict[Path, str] | None = None,
+    ) -> None:
+        """Rewrite per-file reasons once the deletion prompt is answered.
+
+        Deferred deletions park ``SOURCE_REMOVAL_PENDING_REASON`` on each
+        copied file; without this rewrite an exported report would keep
+        showing that placeholder forever. Files that were really deleted
+        become ``source removed``, declined prompts become
+        ``source removal cancelled`` and deletion errors carry the
+        ``source removal failed:`` prefix with the OS error.
+        """
+        removed = removed or set()
+        failures = failures or {}
+        for result in self.results:
+            if result.reason != SOURCE_REMOVAL_PENDING_REASON:
+                continue
+            if result.source in removed:
+                result.reason = SOURCE_REMOVED_REASON
+            elif result.source in failures:
+                result.reason = (
+                    f"{SOURCE_REMOVAL_FAILED_PREFIX}{failures[result.source]}"
+                )
+            elif not confirmed:
+                result.reason = SOURCE_REMOVAL_CANCELLED_REASON
 
     @property
     def verified_existing_count(self) -> int:

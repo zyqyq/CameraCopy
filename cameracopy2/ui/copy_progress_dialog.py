@@ -835,6 +835,7 @@ class CopyProgressDialog(QDialog):
 
         if box.clickedButton() is not delete_button:
             report.removal_confirmed = False
+            report.resolve_source_removals(confirmed=False)
             message = (
                 f"Kept {len(entries)} source file(s); deletion cancelled."
             )
@@ -844,17 +845,24 @@ class CopyProgressDialog(QDialog):
 
         removed = 0
         removed_bytes = 0
+        removed_sources: set[Path] = set()
         failures: list[tuple[Path, str]] = []
+        failure_map: dict[Path, str] = {}
         for source, size in entries:
             error = remove_source_file(source)
             if error is None:
                 removed += 1
                 removed_bytes += size
+                removed_sources.add(source)
             else:
                 failures.append((source, error))
+                failure_map[source] = error
         report.removal_confirmed = True
         report.confirmed_removals = removed
         report.confirmed_removal_bytes = removed_bytes
+        report.resolve_source_removals(
+            confirmed=True, removed=removed_sources, failures=failure_map
+        )
         message = (
             f"Deleted {removed} source file(s) after confirmation "
             f"({format_log_file_size(removed_bytes)})."

@@ -60,6 +60,8 @@ from cameracopy2.models import (
     FileCopyResult,
     HashResult,
     ReplicaResult,
+    SOURCE_REMOVAL_PENDING_REASON,
+    SOURCE_REMOVED_REASON,
     VolumeInfo,
     VolumeMismatchDecision,
 )
@@ -2769,7 +2771,7 @@ class CopyEngine:
                     timestamp=context.timestamp,
                     timestamp_source=context.timestamp_source,
                     rating_source=context.rating_source,
-                    reason="source removed",
+                    reason=SOURCE_REMOVED_REASON,
                     size_bytes=context.source_size,
                     bytes_copied=bytes_copied,
                     copy_mode=copy_mode,
@@ -2777,7 +2779,7 @@ class CopyEngine:
                 )
             # Deferred: the file was copied; its deletion waits for the
             # user to confirm the prompt shown when the job finishes.
-            incomplete_reason = "source removal pending confirmation"
+            incomplete_reason = SOURCE_REMOVAL_PENDING_REASON
 
         return FileCopyResult(
             source=context.source,

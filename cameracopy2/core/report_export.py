@@ -137,7 +137,9 @@ def _result_value(result: FileCopyResult, key: str) -> str:
     if key == "backups":
         return _backup_status(result)
     if key == "failure_reason":
-        return (result.error or result.reason or "").strip()
+        # Reasons are English log-style strings; translate_log applies the
+        # pattern rules for dynamic ones ("source removal failed: …").
+        return translate_log((result.error or result.reason or "").strip())
     raise KeyError(key)
 
 

@@ -6,6 +6,7 @@ from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 
 from .config import ConfigReadError, default_config_path, load_config
+from . import i18n
 from .models import CameraCopyConfig
 from .resources import resource_path
 from .ui.main_window import MainWindow
@@ -47,6 +48,8 @@ def main() -> int:
     except ConfigReadError as exc:
         config_error = exc
         config = CameraCopyConfig()
+    i18n.set_language(config.language)
+    i18n.install(app)
     apply_theme(app, config.theme)
     window = MainWindow(config_path=config_path, config=config)
     window.show()

@@ -14,7 +14,11 @@ from .models import (
     DEFAULT_INCLUDE_PATTERNS,
     CameraCopyConfig,
     CollisionPolicy,
+    HashMethod,
+    LanguageMode,
+    RedundantWriteMode,
     ThemeMode,
+    VerificationMode,
     VolumeMatch,
     VolumeMatchMethod,
 )
@@ -41,6 +45,10 @@ _WINDOWS_RESERVED_FOLDER_NAMES = re.compile(
 _ALLOWED_AUTOFORMATS = {None, "FAT32", "exFAT", "NTFS", "ext2", "ext3", "ext4"}
 _ALLOWED_COLLISION_POLICIES = {"skip", "overwrite", "rename", "ask"}
 _ALLOWED_THEMES = {"system", "light", "dark"}
+_ALLOWED_LANGUAGES = {"zh_CN", "en"}
+_ALLOWED_HASH_METHODS = {"sha256", "xxhash64"}
+_ALLOWED_VERIFICATION_MODES = {"per_file", "batch"}
+_ALLOWED_REDUNDANT_WRITE_MODES = {"parallel", "sequential"}
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _ALLOWED_VOLUME_MATCH_METHODS = {
     "device_serial",
@@ -160,6 +168,11 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         version=CONFIG_VERSION,
         source=normalize_source_subfolder(_read_str(data, "source", default.source)),
         destination=_read_destination(data, default.destination),
+        redundantbackup=_read_bool(data, "redundantbackup", default.redundantbackup),
+        additionaldestinations=_read_destination_list(
+            data, "additionaldestinations", default.additionaldestinations
+        ),
+        redundantwritemode=_read_redundant_write_mode(data, default.redundantwritemode),
         includedfiles=_read_str_list(data, "includedfiles", default.includedfiles),
         excludedfiles=_read_str_list(data, "excludedfiles", default.excludedfiles),
         includeddevices=_read_str_list(data, "includeddevices", default.includeddevices),
@@ -186,7 +199,15 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         autoremove=_read_bool(data, "autoremove", default.autoremove),
         formatprompt=_read_bool(data, "formatprompt", default.formatprompt),
         checkhash=_read_bool(data, "checkhash", default.checkhash),
+        hashmethod=_read_hash_method(data, default.hashmethod),
+        verificationmode=_read_verification_mode(data, default.verificationmode),
         durablewrites=_read_bool(data, "durablewrites", default.durablewrites),
+        resumepartialfiles=_read_bool(
+            data, "resumepartialfiles", default.resumepartialfiles
+        ),
+        recoverinterruptedjobs=_read_bool(
+            data, "recoverinterruptedjobs", default.recoverinterruptedjobs
+        ),
         fixsonytimestamps=_read_bool(data, "fixsonytimestamps", default.fixsonytimestamps),
         collisionpolicy=_read_collision_policy(data, default.collisionpolicy),
         applicationname=_read_str(data, "applicationname", default.applicationname),
@@ -198,6 +219,7 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
             data, "applicationenvironment", default.applicationenvironment
         ),
         theme=_read_theme(data, default.theme),
+        language=_read_language(data, default.language),
         copyloginformationcolor=_read_optional_color(
             data, "copyloginformationcolor", default.copyloginformationcolor
         ),
@@ -299,6 +321,35 @@ def _read_str_list(data: dict[str, Any], key: str, default: list[str]) -> list[s
     return result
 
 
+def _read_destination_list(
+    data: dict[str, Any], key: str, default: list[str]
+) -> list[str]:
+    """Read extra destination roots, dropping blanks and case-insensitive duplicates."""
+    if key not in data:
+        return list(default)
+    values = _read_str_list(data, key, [])
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        marker = os.path.normcase(os.path.abspath(os.path.expanduser(value)))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(value)
+    return result
+
+
+def _read_redundant_write_mode(
+    data: dict[str, Any], default: RedundantWriteMode
+) -> RedundantWriteMode:
+    if "redundantwritemode" not in data:
+        return default
+    value = data["redundantwritemode"]
+    if not isinstance(value, str) or value not in _ALLOWED_REDUNDANT_WRITE_MODES:
+        raise UnsupportedConfigError("redundantwritemode must be parallel or sequential.")
+    return cast(RedundantWriteMode, value)
+
+
 def _read_volume_match(data: dict[str, Any], key: str, default: VolumeMatch) -> VolumeMatch:
     if key not in data:
         return VolumeMatch(method=default.method, value=default.value)
@@ -364,6 +415,33 @@ def _read_theme(data: dict[str, Any], default: ThemeMode) -> ThemeMode:
     if not isinstance(value, str) or value not in _ALLOWED_THEMES:
         raise UnsupportedConfigError("theme must be system, light, or dark.")
     return cast(ThemeMode, value)
+
+
+def _read_language(data: dict[str, Any], default: LanguageMode) -> LanguageMode:
+    if "language" not in data:
+        return default
+    value = data["language"]
+    if not isinstance(value, str) or value not in _ALLOWED_LANGUAGES:
+        raise UnsupportedConfigError("language must be zh_CN or en.")
+    return cast(LanguageMode, value)
+
+
+def _read_hash_method(data: dict[str, Any], default: HashMethod) -> HashMethod:
+    if "hashmethod" not in data:
+        return default
+    value = data["hashmethod"]
+    if not isinstance(value, str) or value not in _ALLOWED_HASH_METHODS:
+        raise UnsupportedConfigError("hashmethod must be sha256 or xxhash64.")
+    return cast(HashMethod, value)
+
+
+def _read_verification_mode(data: dict[str, Any], default: VerificationMode) -> VerificationMode:
+    if "verificationmode" not in data:
+        return default
+    value = data["verificationmode"]
+    if not isinstance(value, str) or value not in _ALLOWED_VERIFICATION_MODES:
+        raise UnsupportedConfigError("verificationmode must be per_file or batch.")
+    return cast(VerificationMode, value)
 
 
 def _read_optional_color(

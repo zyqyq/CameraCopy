@@ -32,6 +32,8 @@ FormatRiskKind = Literal[
     "clone_used_second_source",
     "volume_mismatch_skipped",
     "volume_mismatch_kept_existing",
+    "batch_verification_failed",
+    "replica_failed",
 ]
 
 CopyMode = Literal[
@@ -51,7 +53,11 @@ CopyMode = Literal[
     "volume_mismatch_skipped",
 ]
 CollisionPolicy = Literal["skip", "overwrite", "rename", "ask"]
+RedundantWriteMode = Literal["parallel", "sequential"]
 ThemeMode = Literal["system", "light", "dark"]
+LanguageMode = Literal["zh_CN", "en"]
+HashMethod = Literal["sha256", "xxhash64"]
+VerificationMode = Literal["per_file", "batch"]
 VolumeMatchMethod = Literal[
     "device_serial",
     "fs_uuid",
@@ -77,6 +83,9 @@ _WRITTEN_COPY_MODES = {
     "volume_mismatch_replaced",
 }
 
+_HASH_FAILURE_LABELS = {"sha256": "SHA256", "xxhash64": "xxHash64"}
+_HASH_FAILURE_TOKENS = {"sha256": "SHA256", "xxhash64": "XXHASH64"}
+
 
 @dataclass(frozen=True, slots=True)
 class FormatRisk:
@@ -101,6 +110,9 @@ class CameraCopyConfig:
     version: int = CONFIG_VERSION
     source: str = "DCIM"
     destination: str = field(default_factory=lambda: str(Path.home() / "Pictures"))
+    redundantbackup: bool = False
+    additionaldestinations: list[str] = field(default_factory=list)
+    redundantwritemode: RedundantWriteMode = "parallel"
     includedfiles: list[str] = field(default_factory=lambda: list(DEFAULT_INCLUDE_PATTERNS))
     excludedfiles: list[str] = field(default_factory=list)
     includeddevices: list[str] = field(default_factory=list)
@@ -119,7 +131,11 @@ class CameraCopyConfig:
     autoremove: bool = False
     formatprompt: bool = True
     checkhash: bool = True
+    hashmethod: HashMethod = "sha256"
+    verificationmode: VerificationMode = "per_file"
     durablewrites: bool = True
+    resumepartialfiles: bool = True
+    recoverinterruptedjobs: bool = True
     fixsonytimestamps: bool = True
     collisionpolicy: CollisionPolicy = "ask"
     applicationname: str = ""
@@ -127,6 +143,7 @@ class CameraCopyConfig:
     applicationarguments: str = ""
     applicationenvironment: str = ""
     theme: ThemeMode = "system"
+    language: LanguageMode = "zh_CN"
     copyloginformationcolor: str | None = None
     copylogcopiedcolor: str | None = None
     copylogconfirmedcolor: str | None = None
@@ -190,6 +207,36 @@ class VolumeInfo:
 
 
 @dataclass(slots=True)
+class CompletedFileEntry:
+    """One source file an earlier, interrupted run already preserved."""
+
+    relative_path: str = ""
+    destination: str | None = None
+    size_bytes: int = 0
+    mode: str | None = None
+
+
+@dataclass(slots=True)
+class ResumedCopyState:
+    """Everything a restarted job needs to continue an interrupted run.
+
+    ``completed`` is keyed by the volume-scoped source key used in the copy
+    journal, so two volumes holding the same relative path never collide.
+    """
+
+    session_id: str
+    volume_keys: tuple[str, ...] = ()
+    completed: dict[str, CompletedFileEntry] = field(default_factory=dict)
+    completed_bytes: int = 0
+    total_files: int = 0
+
+    def volume_key_for(self, source_index: int) -> str | None:
+        if 0 < source_index <= len(self.volume_keys):
+            return self.volume_keys[source_index - 1]
+        return None
+
+
+@dataclass(slots=True)
 class CopyJob:
     primary: VolumeInfo
     secondary: VolumeInfo | None
@@ -197,6 +244,7 @@ class CopyJob:
     clone_mode: bool = False
     autoremove: bool = False
     format_after_copy: str | None = None
+    resume: ResumedCopyState | None = None
 
     def selected_volumes(self) -> list[VolumeInfo]:
         volumes = [self.primary]
@@ -211,6 +259,36 @@ class HashResult:
     destination_hash: str | None
     ok: bool
     error: str | None = None
+
+
+@dataclass(slots=True)
+class ReplicaResult:
+    """Outcome of writing one source file to one redundant backup destination."""
+
+    root: Path
+    destination: Path | None = None
+    action: CopyAction = "copied"
+    copy_mode: CopyMode | None = None
+    hash_ok: bool | None = None
+    bytes_copied: int = 0
+    reason: str | None = None
+    error: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.action == "failed" or self.error is not None or self.hash_ok is False
+
+    @property
+    def skipped(self) -> bool:
+        return self.action == "skipped"
+
+    @property
+    def verified_existing(self) -> bool:
+        return self.copy_mode == "verified_existing"
+
+    @property
+    def written(self) -> bool:
+        return self.copy_mode in {"copied", "overwrote", "renamed_copy"}
 
 
 @dataclass(slots=True)
@@ -231,10 +309,35 @@ class FileCopyResult:
     volume_mismatch: bool = False
     first_source_destination: Path | None = None
     first_source_size_bytes: int | None = None
+    replicas: list[ReplicaResult] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
-        return self.action == "failed" or self.error is not None or self.hash_ok is False
+        return (
+            self.action == "failed"
+            or self.error is not None
+            or self.hash_ok is False
+            or self.has_replica_failure
+        )
+
+    @property
+    def replica_failures(self) -> list[ReplicaResult]:
+        return [replica for replica in self.replicas if replica.failed]
+
+    @property
+    def has_replica_failure(self) -> bool:
+        return any(replica.failed for replica in self.replicas)
+
+    @property
+    def replica_bytes_copied(self) -> int:
+        return sum(replica.bytes_copied for replica in self.replicas)
+
+    @property
+    def replicas_verified(self) -> bool:
+        """True when every redundant destination holds a fresh or verified copy."""
+        return bool(self.replicas) and all(
+            not replica.failed and not replica.skipped for replica in self.replicas
+        )
 
     @property
     def cancelled(self) -> bool:
@@ -250,6 +353,18 @@ class CopyReport:
     cancelled: bool = False
     prompt_wait_seconds: float = 0.0
     format_risks: list[FormatRisk] = field(default_factory=list)
+    hash_method: str = "sha256"
+    verification_mode: str = "per_file"
+    batch_checked_count: int = 0
+    batch_failed_count: int = 0
+    batch_checked_bytes: int = 0
+    batch_verification_seconds: float = 0.0
+    session_id: str | None = None
+    session_saved: bool = False
+    resumed_files: int = 0
+    resumed_bytes: int = 0
+    partial_resume_count: int = 0
+    resumed_partial_bytes: int = 0
 
     def add_log(self, message: str) -> None:
         self.logs.append(message)
@@ -354,14 +469,23 @@ class CopyReport:
         return len(self.failures)
 
     @property
-    def sha256_failure_count(self) -> int:
+    def hash_failure_count(self) -> int:
+        token = _HASH_FAILURE_TOKENS.get(str(self.hash_method).lower(), "SHA256")
         return sum(
             1
             for result in self.results
             if result.hash_ok is False
-            or "SHA256" in (result.reason or "").upper()
-            or "SHA256" in (result.error or "").upper()
+            or token in (result.reason or "").upper()
+            or token in (result.error or "").upper()
         )
+
+    @property
+    def sha256_failure_count(self) -> int:
+        return self.hash_failure_count
+
+    @property
+    def hash_failure_label(self) -> str:
+        return _HASH_FAILURE_LABELS.get(str(self.hash_method).lower(), "SHA256")
 
     @property
     def total_count(self) -> int:
@@ -405,18 +529,81 @@ class CopyReport:
         self._append_count_line(lines, self.clone_verified_count, "verified clones")
         self._append_count_line(lines, self.skipped_count, "skipped")
         lines.append(f"  {self.failed_count} failed")
-        if self.sha256_failure_count:
-            lines.append(f"SHA256 failures: {self.sha256_failure_count}")
+        if self.hash_failure_count:
+            lines.append(f"{self.hash_failure_label} failures: {self.hash_failure_count}")
+        if self.verification_mode == "batch":
+            lines.append(
+                f"Batch verification ({self.hash_failure_label}): "
+                f"{self.batch_checked_count} checked, {self.batch_failed_count} mismatched"
+            )
+            if self.batch_verification_seconds > 0:
+                lines.append(
+                    f"Batch verification time: "
+                    f"{_format_elapsed_seconds(self.batch_verification_seconds)}"
+                )
         self._append_count_line(lines, self.removed_count, "source files removed")
+        self._append_count_line(lines, self.resumed_files, "already copied by an earlier run")
+        self._append_count_line(lines, self.partial_resume_count, "continued from partial files")
         if self.rating_source_counts:
             lines.append("Ratings:")
             lines.extend(_format_rating_source_counts(self.rating_source_counts))
         lines.append(f"Bytes written: {self.bytes_copied:,}")
+        if self.resumed_partial_bytes:
+            lines.append(
+                f"Bytes continued from partial files: {self.resumed_partial_bytes:,}"
+            )
+        if self.replica_results:
+            lines.append(f"Redundant bytes written: {self.replica_bytes_copied:,}")
         if self.copy_seconds is not None:
             if self.bytes_copied > 0 and self.copy_seconds > 0:
                 average_speed = _format_byte_speed(self.bytes_copied / self.copy_seconds)
                 lines.append(f"Average write speed: {average_speed}")
             lines.append(f"Copy time: {_format_elapsed_seconds(self.copy_seconds)}")
+        return lines
+
+    @property
+    def replica_results(self) -> list[ReplicaResult]:
+        """Flatten every redundant-backup outcome recorded on this report."""
+        return [replica for result in self.results for replica in result.replicas]
+
+    @property
+    def replica_bytes_copied(self) -> int:
+        return sum(replica.bytes_copied for replica in self.replica_results)
+
+    @property
+    def replica_failed_count(self) -> int:
+        return sum(1 for replica in self.replica_results if replica.failed)
+
+    def redundant_backup_lines(self) -> list[str]:
+        """Summarise one redundant-backup destination per line."""
+        stats: dict[str, dict[str, int]] = {}
+        for replica in self.replica_results:
+            entry = stats.setdefault(
+                str(replica.root), {"written": 0, "verified": 0, "skipped": 0, "failed": 0}
+            )
+            if replica.failed:
+                entry["failed"] += 1
+            elif replica.skipped:
+                entry["skipped"] += 1
+            elif replica.verified_existing:
+                entry["verified"] += 1
+            else:
+                entry["written"] += 1
+        if not stats:
+            return []
+
+        lines = ["Redundant backups:"]
+        for root, counts in stats.items():
+            parts: list[str] = []
+            for key, label in (
+                ("written", "written"),
+                ("verified", "verified existing"),
+                ("skipped", "skipped"),
+                ("failed", "failed"),
+            ):
+                if counts[key]:
+                    parts.append(f"{counts[key]} {label}")
+            lines.append(f"  {root}: {', '.join(parts)}")
         return lines
 
     @staticmethod

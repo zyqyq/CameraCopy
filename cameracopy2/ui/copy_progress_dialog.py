@@ -20,11 +20,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cameracopy2.core.copy_engine import BATCH_VERIFY_ACTION
 from cameracopy2.core.format_warnings import (
     format_risk_warning_paragraphs,
     irreversible_format_warning,
 )
 from cameracopy2.core.log_messages import LogMessageType, classify_log_message
+from cameracopy2.core.resume import CopySessionStore
 from cameracopy2.core.transfer_rate import TransferRateEstimator
 from cameracopy2.models import CopyJob, CopyReport, FileCopyResult
 from cameracopy2.operation_log import CopyOperationLog
@@ -52,12 +54,14 @@ class CopyProgressDialog(QDialog):
         parent: QWidget | None = None,
         *,
         operation_log: CopyOperationLog | None = None,
+        session_store: CopySessionStore | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Copy files")
         self.resize(1000, 640)
         self.job = job
         self.operation_log = operation_log
+        self.session_store = session_store
         self.cancel_event = Event()
         self.thread: QThread | None = None
         self.worker: CopyWorker | None = None
@@ -137,20 +141,26 @@ class CopyProgressDialog(QDialog):
         self.byte_progress_bar.setValue(0)
         self.append_log("Validating source volumes…")
 
+    def initial_status_text(self) -> str:
+        """Status shown when the copy starts, which says if it is a recovery."""
+        if self.job.resume is not None:
+            return "Resuming interrupted copy…"
+        return "Starting copy…"
+
     def start(self, job: CopyJob | None = None) -> None:
         if job is not None:
             self.job = job
         self.validation_pending = False
         self.source_status_label.setText("Source: —")
         self.status_label.show()
-        self.status_label.setText("Starting copy…")
+        self.status_label.setText(self.initial_status_text())
         self.file_progress_bar.setRange(0, 100)
         self.file_progress_bar.setValue(0)
         if self.operation_log is not None:
             self.operation_log.info("Copy worker starting")
         self.copy_running = True
         self.thread = QThread(self)
-        self.worker = CopyWorker(self.job, self.cancel_event)
+        self.worker = CopyWorker(self.job, self.cancel_event, self.session_store)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.append_log)
@@ -256,13 +266,18 @@ class CopyProgressDialog(QDialog):
     def _file_action_label(self) -> str:
         if self.source_action == "Verifying clone":
             return "Verifying clone file"
+        if self.source_action == BATCH_VERIFY_ACTION:
+            return "Verifying file"
         return "Copying file"
 
     def _set_source_status(self, bytes_done: int, total_bytes: int, metered: bool) -> None:
         label = self._source_label()
-        action = self.source_action or "Processing"
+        if self.source_action == BATCH_VERIFY_ACTION:
+            prefix = label
+        else:
+            prefix = f"{label}: {self.source_action or 'Processing'}"
         if total_bytes <= 0:
-            self.source_status_label.setText(f"{label}: {action}...")
+            self.source_status_label.setText(f"{prefix}...")
             return
 
         done = max(0, min(bytes_done, total_bytes))
@@ -280,11 +295,13 @@ class CopyProgressDialog(QDialog):
             eta_text = "ETA —"
 
         self.source_status_label.setText(
-            f"{label}: {action} — {self._format_bytes(done)} / {self._format_bytes(total_bytes)} — "
+            f"{prefix} — {self._format_bytes(done)} / {self._format_bytes(total_bytes)} — "
             f"{speed_text} — {eta_text}"
         )
 
     def _source_label(self) -> str:
+        if self.source_action == BATCH_VERIFY_ACTION:
+            return BATCH_VERIFY_ACTION
         if self.source_total > 1:
             return f"Source {self.source_index}/{self.source_total}"
         return "Source"
@@ -847,6 +864,8 @@ class CopyProgressDialog(QDialog):
         self.cancel_event.set()
         self.cancel_button.setEnabled(False)
         self.append_log("Cancel requested. Current file copy will stop at the next chunk boundary.")
+        if self.job.config.recoverinterruptedjobs:
+            self.append_log("The interrupted copy is saved and can be resumed later.")
 
     @Slot()
     def _thread_finished(self) -> None:

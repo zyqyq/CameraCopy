@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtGui import QCloseEvent
@@ -24,8 +25,20 @@ from PySide6.QtWidgets import (
 )
 
 from cameracopy2.config import CONFIG_FILE_NAME, load_config, save_config
+from cameracopy2.core.resume import (
+    CopySession,
+    CopySessionStore,
+    match_session_volumes,
+    session_directory,
+)
 from cameracopy2.core.source_paths import source_display_text
-from cameracopy2.models import CameraCopyConfig, CopyJob, VolumeInfo
+from cameracopy2.models import (
+    CameraCopyConfig,
+    CopyJob,
+    LanguageMode,
+    ResumedCopyState,
+    VolumeInfo,
+)
 from cameracopy2.operation_log import CopyOperationLog
 from cameracopy2.services.format_service import FormatService
 from cameracopy2.services.volume_scan_requests import VolumeScanKind
@@ -37,7 +50,11 @@ from cameracopy2.ui.copy_progress_dialog import CopyProgressDialog
 from cameracopy2.ui.main_widgets import ElidedLabel, VolumeComboBox
 from cameracopy2.ui.settings_dialog import SettingsDialog
 from cameracopy2.ui.theme import apply_theme
-from cameracopy2.ui.tooltips import set_form_row_tooltip, set_help_tooltip
+from cameracopy2.ui.tooltips import (
+    help_tooltip_text,
+    set_form_row_tooltip,
+    set_help_tooltip,
+)
 from cameracopy2.ui.volume_scanner import VolumeScanController
 from cameracopy2.ui.volume_selection import (
     AUTO_PENDING,
@@ -61,15 +78,28 @@ class PendingCopyStart:
     dialog: CopyProgressDialog
 
 
+@dataclass(frozen=True, slots=True)
+class ResumableSession:
+    """An interrupted copy that matches the volumes mounted right now."""
+
+    session: CopySession
+    primary: VolumeInfo
+    secondary: VolumeInfo | None
+
+
 class MainWindow(QMainWindow):
     def __init__(
-        self, config_path: Path | None = None, config: CameraCopyConfig | None = None
+        self,
+        config_path: Path | None = None,
+        config: CameraCopyConfig | None = None,
+        session_store: CopySessionStore | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("CameraCopy")
         self.resize(650, 260)
         self.config_path = config_path or Path(CONFIG_FILE_NAME)
         self.config = config or load_config(self.config_path)
+        self._injected_sessions = session_store
         self.volumes: list[VolumeInfo] = []
         self._volume_snapshot: tuple[tuple[str, str, str, str, str, str, int | None], ...] = tuple()
         self._updating_volume_combos = False
@@ -79,6 +109,8 @@ class MainWindow(QMainWindow):
         self._pending_copy_start: PendingCopyStart | None = None
         self._cancelled_pre_copy_scan_active = False
         self._settings_dialog: SettingsDialog | None = None
+        self._sessions: CopySessionStore | None = None
+        self._resumable: ResumableSession | None = None
 
         self.primary_combo = VolumeComboBox()
         self.secondary_combo = VolumeComboBox()
@@ -106,6 +138,10 @@ class MainWindow(QMainWindow):
         self.refresh_button = QPushButton("Manual\nrescan")
         self.refresh_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.settings_button = QPushButton("Settings")
+        self.resume_button = QPushButton("Resume interrupted copy")
+        self.resume_button.setVisible(False)
+        self.discard_session_button = QPushButton("Discard session")
+        self.discard_session_button.setVisible(False)
         self.start_button = QPushButton("Start copy")
         self.start_button.setDefault(True)
 
@@ -142,6 +178,17 @@ class MainWindow(QMainWindow):
         )
         set_help_tooltip(self.settings_button, "Open CameraCopy settings.")
         set_help_tooltip(
+            self.resume_button,
+            "Continue the interrupted copy that matches the connected volumes.",
+            "CameraCopy reuses the settings of the interrupted run and skips the files "
+            "it already copied.",
+        )
+        set_help_tooltip(
+            self.discard_session_button,
+            "Delete the saved copy session and its partially copied files.",
+            "The files that were already copied to the destination are kept.",
+        )
+        set_help_tooltip(
             self.start_button,
             "Rescan the selected volumes, validate the copy job, and start copying.",
         )
@@ -156,7 +203,7 @@ class MainWindow(QMainWindow):
             form,
             self.clone_checkbox,
             "Treat the second volume as a duplicate of the first.",
-            "CameraCopy copies from the first volume, then SHA256-verifies matching "
+            "CameraCopy copies from the first volume, then hash-verifies matching "
             "files on the second. Files found only on the second volume are reviewed "
             "separately.",
         )
@@ -190,6 +237,8 @@ class MainWindow(QMainWindow):
 
         self.refresh_button.clicked.connect(self.refresh_volumes)
         self.settings_button.clicked.connect(self.open_settings)
+        self.resume_button.clicked.connect(self.start_resumed_copy)
+        self.discard_session_button.clicked.connect(self.discard_resumable_session)
         self.start_button.clicked.connect(self.start_copy)
         self.clone_checkbox.toggled.connect(self._clone_mode_changed)
         self.primary_combo.currentIndexChanged.connect(
@@ -378,6 +427,7 @@ class MainWindow(QMainWindow):
         )
         self._rebuild_volume_combos(primary_id, secondary_id)
         self._update_summaries()
+        self._refresh_resume_state()
 
     @staticmethod
     def _make_volume_snapshot(
@@ -505,12 +555,14 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         self._pause_hotplug_polling()
         dialog = SettingsDialog(self.config, self.volumes, self)
+        dialog.language_changed.connect(self._apply_language_setting)
         self._settings_dialog = dialog
         QTimer.singleShot(0, lambda: self._request_volume_scan("settings_dialog", []))
         try:
             if dialog.exec():
                 self.config = dialog.config()
                 save_config(self.config, self.config_path)
+                self._sessions = None
                 app = QApplication.instance()
                 if isinstance(app, QApplication):
                     apply_theme(app, self.config.theme)
@@ -529,6 +581,191 @@ class MainWindow(QMainWindow):
         if self.config.clonemode == checked:
             return
         self.config.clonemode = checked
+        save_config(self.config, self.config_path)
+
+    # -- interrupted-copy recovery -----------------------------------------
+    def _copy_sessions(self) -> CopySessionStore | None:
+        """Session store for this configuration, or ``None`` when disabled."""
+        if not self.config.recoverinterruptedjobs:
+            return None
+        if self._injected_sessions is not None:
+            return self._injected_sessions
+        if self._sessions is None:
+            store = CopySessionStore(session_directory(self.config_path))
+            store.prune()
+            self._sessions = store
+        return self._sessions
+
+    @Slot()
+    def _refresh_resume_state(self) -> None:
+        """Offer recovery when an interrupted session matches the volumes in use."""
+        store = self._copy_sessions()
+        self._resumable = None
+        if store is not None and self.volumes:
+            for session in store.open_sessions():
+                primary, secondary = match_session_volumes(session, self.volumes)
+                if primary is None:
+                    continue
+                if session.secondary is not None and secondary is None:
+                    continue
+                self._resumable = ResumableSession(
+                    session=session, primary=primary, secondary=secondary
+                )
+                break
+
+        available = self._resumable is not None
+        self.resume_button.setVisible(available)
+        self.discard_session_button.setVisible(available)
+        if not available:
+            return
+        assert self._resumable is not None
+        session = self._resumable.session
+        self.resume_button.setToolTip(
+            help_tooltip_text(
+                f"Continue the copy that was interrupted on {session.created_at}.",
+                f"Destination: {session.destination}",
+                f"Source: {self._resumable.primary.display_name}",
+                f"Files already copied: {session.completed_count}"
+                + (f" of {session.total_files}" if session.total_files else ""),
+                "CameraCopy reuses the settings of the interrupted run and skips the files "
+                "it already copied.",
+            )
+        )
+
+    @Slot()
+    def start_resumed_copy(self) -> None:
+        """Restart the interrupted job stored in the session journal."""
+        resumable = self._resumable
+        if resumable is None:
+            return
+        session = resumable.session
+        operation_log = CopyOperationLog(self.config_path)
+        operation_log.info(
+            "User requested recovery of copy session %s; destination=%s primary=%s "
+            "secondary=%s recorded_files=%s",
+            session.session_id,
+            session.destination,
+            resumable.primary.display_name,
+            resumable.secondary.display_name if resumable.secondary else "none",
+            session.completed_count,
+        )
+        config = session.restored_config()
+        if config is None:
+            operation_log.warning("Copy session settings could not be restored")
+            operation_log.close()
+            QMessageBox.critical(
+                self,
+                "Interrupted copy",
+                "The saved settings of the interrupted copy could not be read, so it "
+                "cannot be resumed. Start a new copy instead.",
+            )
+            return
+        if not self._destination_looks_usable(config.destination):
+            operation_log.warning("Resumed copy stopped: destination is unavailable")
+            operation_log.close()
+            QMessageBox.critical(
+                self,
+                "Destination unavailable",
+                "The destination folder of the interrupted copy is not available:\n"
+                f"{config.destination}\n\nReconnect it and try again, or start a new copy.",
+            )
+            return
+
+        volumes = [
+            resumable.primary,
+            *([resumable.secondary] if resumable.secondary is not None else []),
+        ]
+        if session.format_after_copy and not self._confirm_destination_on_formatted_volume(
+            volumes
+        ):
+            operation_log.warning(
+                "Resumed copy validation failed: destination is on a volume selected "
+                "for formatting"
+            )
+            operation_log.close()
+            return
+
+        job = CopyJob(
+            primary=resumable.primary,
+            secondary=resumable.secondary,
+            config=config,
+            clone_mode=session.clone_mode,
+            autoremove=session.autoremove,
+            format_after_copy=session.format_after_copy,
+            resume=ResumedCopyState(
+                session_id=session.session_id,
+                volume_keys=tuple(session.volume_keys),
+                completed=dict(session.completed),
+                completed_bytes=session.completed_bytes,
+                total_files=session.total_files,
+            ),
+        )
+        dialog = CopyProgressDialog(
+            job,
+            self,
+            operation_log=operation_log,
+            session_store=self._copy_sessions(),
+        )
+        dialog.volumes_changed.connect(self._handle_volumes_changed_after_format)
+        dialog.finished.connect(self._copy_dialog_finished)
+        self._set_copy_setup_enabled(False)
+        self._pause_hotplug_polling()
+        dialog.show()
+        dialog.start(job)
+
+    @Slot()
+    def discard_resumable_session(self) -> None:
+        """Delete the interrupted session and the partial files it produced."""
+        resumable = self._resumable
+        store = self._copy_sessions()
+        if resumable is None or store is None:
+            return
+        session = resumable.session
+        answer = QMessageBox.warning(
+            self,
+            "Discard interrupted copy",
+            "Delete the saved state of the interrupted copy?\n\n"
+            f"Destination: {session.destination}\n"
+            f"Source: {resumable.primary.display_name}\n"
+            f"Files already copied by that run: {session.completed_count}\n\n"
+            "Files that were already copied to the destination are kept. Only the "
+            "recovery information and unfinished partial files are removed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        store.discard(session)
+        self._resumable = None
+        self._refresh_resume_state()
+
+    def _supersede_sessions(self, job: CopyJob) -> None:
+        """Drop sessions that a newly started copy of the same volumes replaces."""
+        store = self._copy_sessions()
+        if store is None:
+            return
+        keep = job.resume.session_id if job.resume is not None else None
+        volumes = job.selected_volumes()
+        for session in store.open_sessions():
+            if session.session_id == keep:
+                continue
+            if session.destination != job.config.destination:
+                continue
+            if match_session_volumes(session, volumes)[0] is None:
+                continue
+            store.discard(session)
+
+    def _destination_looks_usable(self, destination: str) -> bool:
+        if not destination or not self._destination_path_looks_usable(destination):
+            return False
+        try:
+            Path(destination).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        return True
+
+    def _apply_language_setting(self, language: str) -> None:
+        """Persist a language chosen from the settings dialog immediately."""
+        self.config.language = cast(LanguageMode, language)
         save_config(self.config, self.config_path)
 
     def start_copy(self) -> None:
@@ -579,7 +816,7 @@ class MainWindow(QMainWindow):
         )
         operation_log.info(
             "Pre-copy scan requested; primary=%s secondary=%s destination=%s clone=%s "
-            "autoremove=%s format=%s sha256=%s durable_writes=%s",
+            "autoremove=%s format=%s verify=%s hash=%s timing=%s durable_writes=%s",
             primary.display_name,
             secondary.display_name if secondary is not None else "none",
             self.config.destination,
@@ -587,6 +824,8 @@ class MainWindow(QMainWindow):
             self.autoremove_checkbox.isChecked(),
             format_value if isinstance(format_value, str) else "none",
             self.config.checkhash,
+            self.config.hashmethod,
+            self.config.verificationmode,
             self.config.durablewrites,
         )
         self._set_copy_setup_enabled(False)
@@ -692,6 +931,7 @@ class MainWindow(QMainWindow):
         self._pending_copy_start = None
         self._volume_scanner.clear_pending()
         pending.operation_log.info("Pre-copy validation completed successfully")
+        self._supersede_sessions(job)
         pending.dialog.start(job)
 
     @Slot(int)
@@ -710,6 +950,8 @@ class MainWindow(QMainWindow):
             self.autoremove_checkbox,
             self.format_combo,
             self.settings_button,
+            self.resume_button,
+            self.discard_session_button,
             self.start_button,
         ):
             widget.setEnabled(enabled)

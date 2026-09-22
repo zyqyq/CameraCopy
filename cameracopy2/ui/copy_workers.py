@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from cameracopy2.core.copy_engine import CopyEngine
 from cameracopy2.core.log_messages import LogMessageType
+from cameracopy2.core.resume import CopySessionStore
 from cameracopy2.models import (
     CloneMismatchDecision,
     CloneMismatchResponse,
@@ -44,10 +45,16 @@ class CopyWorker(QObject):
     ask_volume_mismatch = Signal(str, str, object, object, int, bool)
     finished = Signal(object)
 
-    def __init__(self, job: CopyJob, cancel_event: Event) -> None:
+    def __init__(
+        self,
+        job: CopyJob,
+        cancel_event: Event,
+        session_store: CopySessionStore | None = None,
+    ) -> None:
         super().__init__()
         self.job = job
         self.cancel_event = cancel_event
+        self.session_store = session_store
         self._collision_event = Event()
         self._collision_decision: CollisionDecision = "skip"
         self._collision_decision_for_all: CollisionDecision | None = None
@@ -79,7 +86,9 @@ class CopyWorker(QObject):
                 clone_mismatch_decision=self.request_clone_mismatch_decision,
                 volume_mismatch_decision=self.request_volume_mismatch_decision,
             )
-            report = CopyEngine().run(self.job, callbacks, self.cancel_event)
+            report = CopyEngine(session_store=self.session_store).run(
+                self.job, callbacks, self.cancel_event
+            )
         except Exception as exc:  # noqa: BLE001 - convert worker failures into a report
             logger.exception("Unexpected copy-worker failure")
             report = self._internal_error_report(exc)

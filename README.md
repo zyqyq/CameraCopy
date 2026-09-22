@@ -20,6 +20,10 @@ cleanup, and guarded post-copy formatting.<br>
 - Optional copying of matching XMP and RapidRaw sidecars.
 - Existing-file handling: ask, skip, overwrite, or keep both.
 - SHA-256 verification and temporary-file writes.
+- Resumable file copies: after a cancel, crash, or power failure the data that was
+  already written is kept as a partial file and continued from that byte offset.
+- Interrupted-copy recovery: the state of a running copy is recorded outside the
+  destination, so the same job can be restarted and only the remaining files are copied.
 - Optional source cleanup after successful preservation.
 - Guarded formatting after a clean copy operation.
 - Per-operation logs, progress, transfer speed, ETA, and cancellation.
@@ -106,6 +110,25 @@ cameracopy
 5. Select the first source volume in the main window.
 6. Optionally select a second volume and enable clone mode.
 7. Start the copy and review the final summary before removing or formatting media.
+
+### Continuing an interrupted copy
+
+If a copy is cancelled, interrupted by a crash, or stopped by a power failure, CameraCopy
+remembers what it had already preserved:
+
+1. Reconnect the same source volume(s) and start CameraCopy again.
+2. **Resume interrupted copy** appears next to the volume selectors. Its tooltip shows the
+   destination and how many files the earlier run already copied.
+3. Select it to repeat the saved job. CameraCopy restores the settings of that run, skips
+   the files that are already complete, and continues partially written files at the byte
+   offset that is really on disk.
+4. Select **Discard session** to delete the recovery information and any unfinished partial
+   files instead. Files that were already copied to the destination are kept.
+
+Recovery is stored in the per-user state directory next to the operation logs, never in the
+destination folder, and it is deleted as soon as the copy finishes successfully. Both
+behaviours can be turned off in **Settings** (**Resume interrupted file copies** on the
+Files tab and **Recover interrupted copy jobs** on the Advanced tab).
 
 
 ## Building

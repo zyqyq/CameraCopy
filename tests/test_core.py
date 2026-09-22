@@ -3284,6 +3284,7 @@ def test_verified_copy_hashes_source_during_transfer_without_rereading_it(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     from cameracopy2.core import copy_engine as copy_module
+    from cameracopy2.core.resume import PARTIAL_SUFFIX
 
     card = tmp_path / "card"
     destination = tmp_path / "pictures"
@@ -3315,7 +3316,10 @@ def test_verified_copy_hashes_source_during_transfer_without_rereading_it(
     assert (destination / source.name).read_bytes() == source.read_bytes()
     assert source not in hashed_paths
     assert len(hashed_paths) == 1
-    assert hashed_paths[0].name.endswith(".cameracopy.tmp")
+    # The destination is written through a hidden temporary file that survives
+    # an interruption so the next run can continue it (resume is on by default).
+    assert hashed_paths[0].name.endswith(PARTIAL_SUFFIX)
+    assert hashed_paths[0].name.startswith(f".{source.name}.")
 
 
 def test_copy_fails_if_source_changes_during_destination_verification(

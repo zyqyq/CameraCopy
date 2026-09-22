@@ -146,7 +146,7 @@ def _result_detail(result: FileCopyResult) -> str:
             result.error
             and result.error != result.reason
             and not (
-                result.reason == "SHA256 FAILED"
+                (result.reason or "").endswith(" FAILED")
                 and result.error == "verification failed"
             )
         ):

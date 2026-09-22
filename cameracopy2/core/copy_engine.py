@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import shutil
@@ -15,12 +14,27 @@ from typing import Literal
 from cameracopy2.core.copy_messages import format_log_file_size, result_message
 from cameracopy2.core.hash import (
     HashProgressCallback,
+    compare_files_cancellable,
     compare_sha256_cancellable,
+    hash_failure_label,
+    hash_file,
+    hash_method_label,
+    new_digest,
     sha256_file,
 )
 from cameracopy2.core.log_messages import classify_file_result, classify_log_message
 from cameracopy2.core.naming import build_destination_file
 from cameracopy2.core.rating_reader import RatingReader
+from cameracopy2.core.resume import (
+    CopySession,
+    CopySessionStore,
+    PartialPlan,
+    finish_partial,
+    partial_paths,
+    partial_size,
+    prepare_partial,
+    volume_key,
+)
 from cameracopy2.core.scanner import find_candidate_files
 from cameracopy2.core.sidecars import SidecarIndex, SidecarMatch, is_sidecar_path
 from cameracopy2.core.source_paths import resolve_source_root
@@ -30,11 +44,13 @@ from cameracopy2.models import (
     CameraCopyConfig,
     CloneMismatchDecision,
     CollisionPolicy,
+    CompletedFileEntry,
     CopyCallbacks,
     CopyJob,
     CopyMode,
     CopyReport,
     FileCopyResult,
+    HashResult,
     VolumeInfo,
     VolumeMismatchDecision,
 )
@@ -42,6 +58,17 @@ from cameracopy2.models import (
 COPY_CHUNK_SIZE = 256 * 1024
 CloneRole = Literal["normal", "primary", "secondary"]
 CloneInventoryState = Literal["selected", "rating_excluded", "skipped"]
+
+BATCH_VERIFY_ACTION = "Batch verification"
+
+#: Number of already-copied files folded into one progress update when an
+#: interrupted job is resumed, so a large card stays responsive.
+RESUME_PROGRESS_BATCH = 200
+
+_VERIFICATION_MODE_LABELS = {
+    "per_file": "each file right after it is copied",
+    "batch": "all copied files after the batch finishes",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +99,21 @@ class VerifiedCopy:
     bytes_copied: int = 0
     cancelled: bool = False
     error: str | None = None
+    source_digest: str | None = None
+    resumed_bytes: int = 0
+
+
+@dataclass(slots=True)
+class BatchVerificationEntry:
+    """A copied file whose destination digest is checked after the batch."""
+
+    source: Path
+    destination: Path
+    digest: str
+    size_bytes: int
+    result: FileCopyResult
+    remove_source: bool = False
+    session_key: str = ""
 
 
 @dataclass(slots=True)
@@ -150,7 +192,14 @@ class CopyEngine:
         self,
         rating_reader: RatingReader | None = None,
         timestamp_resolver: TimestampResolver | None = None,
+        session_store: CopySessionStore | None = None,
     ) -> None:
+        self._batch_entries: list[BatchVerificationEntry] = []
+        self._session_store = session_store
+        self._session: CopySession | None = None
+        self._session_source_root: Path | None = None
+        self._session_volume_key: str | None = None
+        self._session_source_index = 0
         if rating_reader is None and timestamp_resolver is None:
             exiftool = ExifToolService()
             self.rating_reader = RatingReader(exiftool)
@@ -172,6 +221,14 @@ class CopyEngine:
         callbacks = callbacks or CopyCallbacks()
         cancel_event = cancel_event or Event()
         report = CopyReport(started_at=datetime.now())
+        report.hash_method = job.config.hashmethod
+        report.verification_mode = job.config.verificationmode
+        self._batch_entries = []
+        self._session = None
+        self._resume = job.resume
+        self._session_source_root = None
+        self._session_volume_key = None
+        self._session_source_index = 0
         volume_modes = self._volume_modes(job)
         clone_manifest: dict[str, CloneManifestEntry] | None = (
             {} if job.clone_mode and job.secondary else None
@@ -180,7 +237,9 @@ class CopyEngine:
             {} if clone_manifest is not None else None
         )
 
+        self._log_resume_state(callbacks, report, job)
         self._log_start(callbacks, report, job, volume_modes)
+        self._start_session(job, callbacks, report)
         active_source = job.primary.mount_path
 
         try:
@@ -210,6 +269,8 @@ class CopyEngine:
                     source_index=index,
                     source_count=source_count,
                 )
+
+            self._run_batch_verification(callbacks, report, job, cancel_event)
         except Exception as exc:  # noqa: BLE001 - preserve completed copy results
             logger.exception("Unexpected copy-engine failure")
             result = FileCopyResult(
@@ -224,9 +285,175 @@ class CopyEngine:
             if cancel_event.is_set():
                 report.cancelled = True
             report.finished_at = datetime.now()
+            self._close_session(callbacks, report)
             for line in report.summary_lines():
                 report.add_log(line)
         return report
+
+    # -- interrupted-job recovery ------------------------------------------
+    def _log_resume_state(
+        self, callbacks: CopyCallbacks, report: CopyReport, job: CopyJob
+    ) -> None:
+        resume = job.resume
+        if resume is None:
+            return
+        report.resumed_bytes = 0
+        self._log(
+            callbacks,
+            report,
+            f"Resumed session: {resume.session_id} "
+            f"({len(resume.completed)} file(s) preserved by the earlier run)",
+        )
+
+    def _start_session(
+        self, job: CopyJob, callbacks: CopyCallbacks, report: CopyReport
+    ) -> None:
+        store = self._session_store
+        if store is None:
+            return
+        resume = job.resume
+        session: CopySession | None = None
+        resumed = False
+        if resume is not None and resume.session_id:
+            session = store.load(resume.session_id)
+            resumed = session is not None
+        if session is None:
+            session = store.create(job)
+        self._session = session
+        report.session_id = session.session_id
+        self._log(callbacks, report, f"Copy session: {session.session_id}")
+        if resumed:
+            self._log(
+                callbacks,
+                report,
+                "Interrupted copies of this job can be resumed while it runs.",
+            )
+        else:
+            self._log(
+                callbacks,
+                report,
+                "Interrupted copies can be resumed from the saved session.",
+            )
+
+    def _close_session(self, callbacks: CopyCallbacks, report: CopyReport) -> None:
+        session = self._session
+        if session is None or self._session_store is None:
+            return
+        clean = not report.cancelled and not report.has_failures
+        try:
+            self._session_store.finish(session, clean=clean, failures=report.failed_count)
+        except OSError as exc:  # pragma: no cover - journal writes are best effort
+            logger.warning("Could not close copy session %s: %s", session.session_id, exc)
+        report.session_saved = not clean
+        if clean:
+            self._log(callbacks, report, "Copy session finished; nothing is left to resume.")
+        else:
+            self._log(
+                callbacks,
+                report,
+                "Interrupted copy stopped; it can be resumed later.",
+            )
+
+    def _session_key(self, source: Path, source_root: Path | None = None) -> str | None:
+        """Journal key for ``source``; ``None`` when nothing is being recorded."""
+        if self._session is None or self._session_volume_key is None:
+            return None
+        root = source_root or self._session_source_root
+        if root is None:
+            return None
+        return f"{self._session_volume_key}|{self._relative_source_path(root, source)}"
+
+    def _record_session_result(self, result: FileCopyResult) -> None:
+        session = self._session
+        store = self._session_store
+        if session is None or store is None or result.failed or result.cancelled:
+            return
+        key = self._session_key(result.source)
+        if key is None:
+            return
+        assert self._session_source_root is not None
+        store.record(
+            session,
+            key=key,
+            relative_path=self._relative_source_path(
+                self._session_source_root, result.source
+            ),
+            destination=result.destination,
+            size_bytes=result.size_bytes,
+            mode=result.copy_mode or result.action,
+        )
+
+    def _forget_session_result(self, key: str) -> None:
+        if self._session is None or self._session_store is None or not key:
+            return
+        self._session_store.unrecord(self._session, key)
+
+    @staticmethod
+    def _volume_journal_key(volume: VolumeInfo, resume_key: str | None) -> str:
+        if resume_key:
+            return resume_key
+        return volume_key(volume)
+
+    def _drop_resumed_work(
+        self,
+        files: list[Path],
+        sidecars_by_media: dict[Path, tuple[SidecarWork, ...]],
+        source_root: Path,
+        callbacks: CopyCallbacks,
+        report: CopyReport,
+    ) -> tuple[list[Path], dict[Path, tuple[SidecarWork, ...]]]:
+        """Remove the files an interrupted run of the same job already copied.
+
+        A media file is only skipped together with every sidecar that belongs to
+        it, because companion sidecars are placed relative to the media file's
+        destination and cannot be resolved without copying the media file again.
+        """
+        resume = self._resume
+        if resume is None or not resume.completed:
+            return files, sidecars_by_media
+
+        def already_done(path: Path) -> bool:
+            key = f"{self._session_volume_key}|{self._relative_source_path(source_root, path)}"
+            entry = resume.completed.get(key)
+            return entry is not None and self._resumed_entry_intact(entry)
+
+        remaining: list[Path] = []
+        kept_sidecars: dict[Path, tuple[SidecarWork, ...]] = {}
+        skipped = 0
+        skipped_bytes = 0
+        for path in files:
+            works = sidecars_by_media.get(path, ())
+            if already_done(path) and all(already_done(work.match.path) for work in works):
+                skipped += 1
+                skipped_bytes += self._source_size(path)
+                for work in works:
+                    skipped += 1
+                    skipped_bytes += self._source_size(work.match.path)
+                continue
+            remaining.append(path)
+            if path in sidecars_by_media:
+                kept_sidecars[path] = works
+
+        if skipped:
+            report.resumed_files += skipped
+            report.resumed_bytes += skipped_bytes
+            self._log(
+                callbacks,
+                report,
+                f"Resumed session: {skipped} of {skipped + len(remaining)} file(s) "
+                "were already copied and were skipped.",
+            )
+        return remaining, kept_sidecars
+
+    @staticmethod
+    def _resumed_entry_intact(entry: CompletedFileEntry) -> bool:
+        """True when the destination recorded for ``entry`` is still usable."""
+        if not entry.destination:
+            return True
+        try:
+            return Path(entry.destination).stat().st_size == entry.size_bytes
+        except OSError:
+            return False
 
     @staticmethod
     def _volume_modes(job: CopyJob) -> list[tuple[VolumeInfo, bool]]:
@@ -252,10 +479,14 @@ class CopyEngine:
         self._log(
             callbacks,
             report,
-            f"Verification: {'SHA256' if job.config.checkhash else 'basic size check'}",
+            f"Verification: {self._verification_label(job.config)}",
         )
         if job.clone_mode and job.secondary is not None:
-            self._log(callbacks, report, "Clone verification: SHA256")
+            self._log(
+                callbacks,
+                report,
+                f"Clone verification: {hash_failure_label(job.config.hashmethod)}",
+            )
         self._log(
             callbacks,
             report,
@@ -284,6 +515,200 @@ class CopyEngine:
             "rename": "Keep both",
         }
         return labels.get(policy, policy)
+
+    @staticmethod
+    def _verification_label(config: CameraCopyConfig) -> str:
+        if not config.checkhash:
+            return "basic size check"
+        mode = _VERIFICATION_MODE_LABELS.get(config.verificationmode, config.verificationmode)
+        return f"{hash_failure_label(config.hashmethod)} ({mode})"
+
+    @staticmethod
+    def _verification_mode(config: CameraCopyConfig, force_verify: bool) -> str:
+        """Mode used when verification is enabled; forced copies keep per-file checks."""
+        if force_verify:
+            return "per_file"
+        return config.verificationmode
+
+    def _digest_path(
+        self,
+        path: Path,
+        hash_method: str,
+        cancel_event: Event | None = None,
+        progress: HashProgressCallback | None = None,
+    ) -> str:
+        """Hash ``path`` with the configured method.
+
+        SHA-256 keeps going through the module-level ``sha256_file`` so existing
+        callers and tests can continue to substitute it.
+        """
+        if hash_method == "sha256":
+            return sha256_file(path, cancel_event=cancel_event, progress=progress)
+        return hash_file(path, method=hash_method, cancel_event=cancel_event, progress=progress)
+
+    @staticmethod
+    def _compare_files(
+        source: Path,
+        destination: Path,
+        cancel_event: Event | None,
+        hash_method: str,
+        source_progress: HashProgressCallback | None = None,
+    ) -> HashResult:
+        """Compare two files with the configured method."""
+        if hash_method == "sha256":
+            return compare_sha256_cancellable(
+                source, destination, cancel_event, source_progress
+            )
+        return compare_files_cancellable(
+            source,
+            destination,
+            cancel_event,
+            method=hash_method,
+            source_progress=source_progress,
+        )
+
+    def _run_batch_verification(
+        self,
+        callbacks: CopyCallbacks,
+        report: CopyReport,
+        job: CopyJob,
+        cancel_event: Event,
+    ) -> None:
+        """Verify every copied destination once the whole job has finished writing."""
+        if report.verification_mode != "batch" or not job.config.checkhash:
+            return
+
+        label = hash_failure_label(job.config.hashmethod)
+        entries = [entry for entry in self._batch_entries if entry.result.action != "skipped"]
+        if not entries:
+            self._log(callbacks, report, f"Batch verification ({label}): nothing to verify.")
+            return
+
+        if cancel_event.is_set():
+            report.cancelled = True
+            self._log(
+                callbacks,
+                report,
+                f"Batch verification ({label}) skipped because the copy was cancelled.",
+            )
+            return
+
+        self._log(callbacks, report, "")
+        self._log(
+            callbacks,
+            report,
+            f"Verifying {len(entries)} copied file(s) with {hash_method_label(job.config.hashmethod)}...",
+        )
+        total_bytes = sum(entry.size_bytes for entry in entries)
+        callbacks.emit_source_started(1, 1, BATCH_VERIFY_ACTION, total_bytes)
+        callbacks.emit_source_progress(0, total_bytes, False)
+
+        started = time.perf_counter()
+        done_bytes = 0
+        failures = 0
+        entry_total = len(entries)
+        for index, entry in enumerate(entries, start=1):
+            if cancel_event.is_set():
+                report.cancelled = True
+                self._log(callbacks, report, "Batch verification cancelled.")
+                break
+
+            callbacks.emit_file_started(entry.destination, index, entry_total, entry.size_bytes)
+            callbacks.emit_byte_progress(0, entry.size_bytes, index)
+            progress = self._verification_progress_callback(
+                callbacks, done_bytes, total_bytes, index
+            )
+            digest: str | None = None
+            error: str | None = None
+            try:
+                digest = self._digest_path(
+                    entry.destination,
+                    report.hash_method,
+                    cancel_event,
+                    progress,
+                )
+            except InterruptedError:
+                report.cancelled = True
+                self._log(callbacks, report, "Batch verification cancelled.")
+                break
+            except Exception as exc:  # noqa: BLE001 - keep verifying the remaining files
+                error = _friendly_exception_error(exc)
+
+            if error is not None or digest != entry.digest:
+                failures += 1
+                self._fail_batch_verification(callbacks, report, entry, error, label)
+            elif entry.remove_source:
+                self._remove_after_batch_verification(callbacks, report, entry)
+            else:
+                entry.result.hash_ok = True
+
+            done_bytes += entry.size_bytes
+            callbacks.emit_byte_progress(entry.size_bytes, entry.size_bytes, index)
+            callbacks.emit_source_progress(done_bytes, total_bytes, True)
+
+        elapsed = time.perf_counter() - started
+        report.batch_checked_count = entry_total if not report.cancelled else 0
+        report.batch_failed_count = failures
+        report.batch_checked_bytes = done_bytes
+        report.batch_verification_seconds = elapsed
+        self._log(
+            callbacks,
+            report,
+            f"Batch verification finished: {entry_total} checked, {failures} mismatch(es), "
+            f"{format_log_file_size(done_bytes)} read in {elapsed:.1f}s.",
+        )
+
+    def _fail_batch_verification(
+        self,
+        callbacks: CopyCallbacks,
+        report: CopyReport,
+        entry: BatchVerificationEntry,
+        error: str | None,
+        label: str,
+    ) -> None:
+        """Turn an already-reported copy into a failure now that the bytes differ."""
+        result = entry.result
+        self._forget_session_result(entry.session_key)
+        result.action = "failed"
+        result.copy_mode = None
+        result.hash_ok = False
+        result.reason = f"batch verification failed ({label})"
+        result.error = error or "destination does not match the source"
+        report.add_format_risk("batch_verification_failed", entry.source)
+        self._log(
+            callbacks,
+            report,
+            f"{label.upper()} MISMATCH: {entry.destination} does not match "
+            f"{entry.source} ({format_log_file_size(entry.size_bytes)}); "
+            "the source file was kept",
+        )
+        callbacks.emit_result(result)
+
+    def _remove_after_batch_verification(
+        self,
+        callbacks: CopyCallbacks,
+        report: CopyReport,
+        entry: BatchVerificationEntry,
+    ) -> None:
+        result = entry.result
+        remove_error = self._remove_source(entry.source)
+        if remove_error is not None:
+            result.action = "failed"
+            result.copy_mode = None
+            result.hash_ok = True
+            result.reason = "source removal failed"
+            result.error = remove_error
+            self._log(
+                callbacks,
+                report,
+                f"SOURCE REMOVAL FAILED: {entry.source} — {remove_error}",
+            )
+            callbacks.emit_result(result)
+            return
+        result.action = "removed"
+        result.hash_ok = True
+        result.reason = "source removed"
+        callbacks.emit_result(result)
 
     def _run_volume(
         self,
@@ -315,6 +740,12 @@ class CopyEngine:
             return
 
         source_root = resolve_source_root(volume, config.source)
+        self._session_source_index = source_index
+        self._session_source_root = source_root
+        self._session_volume_key = self._volume_journal_key(
+            volume,
+            self._resume.volume_key_for(source_index) if self._resume else None,
+        )
         callbacks.emit_source_started(source_index, source_count, "Scanning", 0)
         self._log(callbacks, report, f"Scanning {source_root}")
         if not source_root.exists():
@@ -355,6 +786,13 @@ class CopyEngine:
                 return
 
         sidecar_index, files, sidecars_by_media = self._prepare_sidecar_work(files, config)
+        files, sidecars_by_media = self._drop_resumed_work(
+            files,
+            sidecars_by_media,
+            source_root,
+            callbacks,
+            report,
+        )
         sidecar_count = sum(len(matches) for matches in sidecars_by_media.values())
         source_total_bytes = sum(self._source_size(path) for path in files) + sum(
             self._source_size(work.match.path)
@@ -443,6 +881,8 @@ class CopyEngine:
                 callbacks,
                 report,
                 cancel_event,
+                config.hashmethod,
+                resume_partial=config.resumepartialfiles,
             )
             if cancel_event.is_set():
                 report.cancelled = True
@@ -530,6 +970,7 @@ class CopyEngine:
             source_done_bytes=progress.done_bytes,
             source_total_bytes=progress.total_bytes,
             clone_mismatches=clone_mismatches,
+            hash_method=config.hashmethod,
         )
         if result is not None:
             self._emit_result(callbacks, report, result)
@@ -868,8 +1309,12 @@ class CopyEngine:
             verification_progress = self._verification_progress_callback(
                 callbacks, progress.done_bytes, progress.total_bytes, file_index
             )
-            hash_result = compare_sha256_cancellable(
-                context.source, context.destination, cancel_event, verification_progress
+            hash_result = self._compare_files(
+                context.source,
+                context.destination,
+                cancel_event,
+                config.hashmethod,
+                verification_progress,
             )
             if cancel_event.is_set() or hash_result.error == "cancelled":
                 return FileCopyResult(
@@ -886,7 +1331,10 @@ class CopyEngine:
                     destination=context.destination,
                     action="failed",
                     hash_ok=False,
-                    reason="volume mismatch SHA256 comparison failed",
+                    reason=(
+                        "volume mismatch "
+                        f"{hash_failure_label(config.hashmethod)} comparison failed"
+                    ),
                     error=hash_result.error,
                     size_bytes=context.source_size,
                     volume_mismatch=True,
@@ -977,7 +1425,7 @@ class CopyEngine:
             report,
             cancel_event,
             file_index,
-            force_sha256=True,
+            force_verify=True,
             source_done_bytes=progress.done_bytes,
             source_total_bytes=progress.total_bytes,
             companion_matches=mismatch.companion_matches,
@@ -1021,7 +1469,7 @@ class CopyEngine:
                 report,
                 cancel_event,
                 file_index,
-                force_sha256=True,
+                force_verify=True,
                 source_done_bytes=progress.done_bytes,
                 source_total_bytes=progress.total_bytes,
             )
@@ -1143,7 +1591,7 @@ class CopyEngine:
                     report,
                     cancel_event,
                     file_index,
-                    force_sha256=clone_role == "primary",
+                    force_verify=clone_role == "primary",
                     source_done_bytes=source_done_bytes,
                     source_total_bytes=source_total_bytes,
                     companion_matches=companion_matches,
@@ -1206,6 +1654,7 @@ class CopyEngine:
                 source_done_bytes=progress.done_bytes,
                 source_total_bytes=progress.total_bytes,
                 clone_mismatches=clone_mismatches,
+                hash_method=config.hashmethod,
             )
         else:
             context = self._build_sidecar_copy_context(
@@ -1222,7 +1671,7 @@ class CopyEngine:
                 report,
                 cancel_event,
                 file_index,
-                force_sha256=(
+                force_verify=(
                     clone_role == "primary" and work.explicitly_selected
                 ),
                 source_done_bytes=progress.done_bytes,
@@ -1251,7 +1700,7 @@ class CopyEngine:
         cancel_event: Event,
         file_index: int,
         *,
-        force_sha256: bool = False,
+        force_verify: bool = False,
         source_done_bytes: int = 0,
         source_total_bytes: int = 0,
         companion_matches: tuple[SidecarMatch, ...] = (),
@@ -1297,11 +1746,17 @@ class CopyEngine:
                     context, destination, "source and destination are the same file"
                 )
 
+            verify = config.checkhash or force_verify
+            verify_mode = self._verification_mode(config, force_verify)
+            defer_verification = verify and verify_mode == "batch"
             copy_result = self._copy_to_destination(
                 source=source,
                 destination=destination,
-                checkhash=config.checkhash or force_sha256,
+                checkhash=verify,
+                hash_method=config.hashmethod,
+                verify_after_copy=not defer_verification,
                 durable_writes=config.durablewrites,
+                resume_partial=config.resumepartialfiles,
                 callbacks=callbacks,
                 cancel_event=cancel_event,
                 file_index=file_index,
@@ -1323,7 +1778,7 @@ class CopyEngine:
                 )
             if not copy_result.ok:
                 failure_reason = self._copy_failure_reason(
-                    copy_result, config.checkhash or force_sha256
+                    copy_result, verify, config.hashmethod
                 )
                 return FileCopyResult(
                     source=source,
@@ -1340,14 +1795,31 @@ class CopyEngine:
                     bytes_copied=copy_result.bytes_copied,
                 )
 
-            return self._finalize_successful_copy(
+            if copy_result.resumed_bytes:
+                report.partial_resume_count += 1
+                report.resumed_partial_bytes += copy_result.resumed_bytes
+            result = self._finalize_successful_copy(
                 context=context,
                 destination=destination,
                 autoremove=autoremove,
                 bytes_copied=copy_result.bytes_copied,
                 copy_mode=copy_mode,
                 hash_ok=copy_result.hash_ok,
+                defer_removal=defer_verification,
             )
+            if defer_verification and copy_result.source_digest is not None:
+                self._batch_entries.append(
+                    BatchVerificationEntry(
+                        source=source,
+                        destination=destination,
+                        digest=copy_result.source_digest,
+                        size_bytes=context.source_size,
+                        result=result,
+                        remove_source=autoremove,
+                        session_key=self._session_key(source) or "",
+                    )
+                )
+            return result
         except Exception as exc:  # noqa: BLE001
             return FileCopyResult(source=source, destination=None, action="failed", error=str(exc))
 
@@ -1365,6 +1837,7 @@ class CopyEngine:
         source_done_bytes: int = 0,
         source_total_bytes: int = 0,
         clone_mismatches: list[CloneMismatchWork] | None = None,
+        hash_method: str = "sha256",
     ) -> FileCopyResult | None:
         verification_progress = self._verification_progress_callback(
             callbacks,
@@ -1372,8 +1845,12 @@ class CopyEngine:
             source_total_bytes,
             file_index,
         )
-        hash_result = compare_sha256_cancellable(
-            source, entry.destination, cancel_event, verification_progress
+        hash_result = self._compare_files(
+            source,
+            entry.destination,
+            cancel_event,
+            hash_method,
+            verification_progress,
         )
         if cancel_event.is_set() or hash_result.error == "cancelled":
             return FileCopyResult(
@@ -1389,7 +1866,7 @@ class CopyEngine:
                 destination=entry.destination,
                 action="failed",
                 hash_ok=False,
-                reason="clone SHA256 comparison failed",
+                reason=f"clone {hash_failure_label(hash_method)} comparison failed",
                 error=hash_result.error,
                 size_bytes=source_size,
             )
@@ -1423,6 +1900,8 @@ class CopyEngine:
         callbacks: CopyCallbacks,
         report: CopyReport,
         cancel_event: Event,
+        hash_method: str = "sha256",
+        resume_partial: bool = False,
     ) -> None:
         for mismatch in mismatches:
             if cancel_event.is_set():
@@ -1441,6 +1920,8 @@ class CopyEngine:
                 durable_writes,
                 callbacks,
                 cancel_event,
+                hash_method,
+                resume_partial=resume_partial,
             )
             if result.copy_mode == "clone_mismatch_skipped":
                 report.add_format_risk("clone_kept_first_source", mismatch.source)
@@ -1464,6 +1945,8 @@ class CopyEngine:
         durable_writes: bool,
         callbacks: CopyCallbacks,
         cancel_event: Event,
+        hash_method: str = "sha256",
+        resume_partial: bool = False,
     ) -> FileCopyResult:
         source = mismatch.source
         entry = mismatch.entry
@@ -1501,7 +1984,9 @@ class CopyEngine:
             source=source,
             destination=destination,
             checkhash=True,
+            hash_method=hash_method,
             durable_writes=durable_writes,
+            resume_partial=resume_partial,
             callbacks=callbacks,
             cancel_event=cancel_event,
             file_index=mismatch.file_index,
@@ -1521,7 +2006,7 @@ class CopyEngine:
                 destination=destination,
                 action="failed",
                 hash_ok=copy_result.hash_ok,
-                reason=self._copy_failure_reason(copy_result, checkhash=True),
+                reason=self._copy_failure_reason(copy_result, checkhash=True, hash_method=hash_method),
                 error=copy_result.error,
                 size_bytes=source_size,
                 bytes_copied=copy_result.bytes_copied,
@@ -1813,8 +2298,9 @@ class CopyEngine:
         bytes_copied: int,
         copy_mode: CopyMode,
         hash_ok: bool | None,
+        defer_removal: bool = False,
     ) -> FileCopyResult:
-        if autoremove:
+        if autoremove and not defer_removal:
             remove_error = self._remove_source(context.source)
             if remove_error is not None:
                 return FileCopyResult(
@@ -1870,32 +2356,86 @@ class CopyEngine:
         callbacks: CopyCallbacks,
         cancel_event: Event,
         file_index: int,
+        hash_method: str = "sha256",
+        verify_after_copy: bool = True,
         source_done_bytes: int = 0,
         source_total_bytes: int = 0,
+        resume_partial: bool = False,
     ) -> VerifiedCopy:
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             source_stat = source.stat()
             source_size = source_stat.st_size
+        except OSError as exc:
+            return VerifiedCopy(ok=False, hash_ok=None, error=f"cannot read source: {exc}")
+
+        already_written = partial_size(destination) if resume_partial else 0
+        try:
             free_bytes = shutil.disk_usage(destination.parent).free
         except OSError as exc:
             return VerifiedCopy(ok=False, hash_ok=None, error=f"cannot check free space: {exc}")
-        if free_bytes < source_size:
+        needed_bytes = max(0, source_size - min(already_written, source_size))
+        if free_bytes < needed_bytes:
             return VerifiedCopy(
                 ok=False,
                 hash_ok=None,
                 error=(
                     f"not enough free space in {destination.parent} "
-                    f"({free_bytes:,} free, {source_size:,} needed)"
+                    f"({free_bytes:,} free, {needed_bytes:,} needed)"
                 ),
             )
 
-        temp_path: Path | None = None
-        bytes_done = 0
-        source_digest = hashlib.sha256() if checkhash else None
+        plan: PartialPlan | None = None
+        if resume_partial:
+            try:
+                plan = prepare_partial(
+                    destination,
+                    source_size=source_size,
+                    source_mtime_ns=source_stat.st_mtime_ns,
+                    hash_method=hash_method,
+                )
+            except OSError as exc:
+                return VerifiedCopy(
+                    ok=False,
+                    hash_ok=None,
+                    error=f"cannot prepare the partial copy: {exc}",
+                )
+
+        temp_path: Path | None = plan.data if plan is not None else None
+        bytes_done = plan.offset if plan is not None else 0
+        resumed_bytes = bytes_done
+        source_digest = new_digest(hash_method) if checkhash else None
         try:
-            temp_path = self._create_temporary_destination(destination)
-            with source.open("rb") as src, temp_path.open("wb") as dst:
+            if plan is None:
+                temp_path = self._create_temporary_destination(destination)
+            assert temp_path is not None
+
+            if source_digest is not None and bytes_done > 0:
+                hashed = self._rebuild_digest(
+                    temp_path, source_digest, bytes_done, cancel_event
+                )
+                if hashed is None:
+                    self._release_temporary(
+                        temp_path, plan, destination, offset=bytes_done, keep_partial=True
+                    )
+                    return VerifiedCopy(
+                        ok=False,
+                        hash_ok=None,
+                        bytes_copied=0,
+                        cancelled=True,
+                        error="cancelled",
+                    )
+                bytes_done = hashed
+                resumed_bytes = hashed
+                if bytes_done > 0:
+                    self._log_resumed_partial(
+                        callbacks, source, bytes_done, source_size, source_total_bytes,
+                        source_done_bytes, file_index,
+                    )
+
+            with source.open("rb") as src, temp_path.open("ab") as dst:
+                if bytes_done > 0:
+                    src.seek(bytes_done)
                 while True:
                     if cancel_event.is_set():
                         break
@@ -1915,35 +2455,72 @@ class CopyEngine:
                     dst.flush()
                     os.fsync(dst.fileno())
             if cancel_event.is_set():
-                self._safe_unlink(temp_path)
+                self._release_temporary(
+                    temp_path, plan, destination, offset=bytes_done, keep_partial=True
+                )
                 return VerifiedCopy(
                     ok=False,
                     hash_ok=None,
                     bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
                     cancelled=True,
                     error="cancelled",
                 )
 
             if _source_stat_changed(source_stat, source.stat()):
-                self._safe_unlink(temp_path)
+                self._release_temporary(
+                    temp_path, plan, destination, offset=bytes_done, keep_partial=False
+                )
                 return VerifiedCopy(
                     ok=False,
                     hash_ok=False if checkhash else None,
                     bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
                     error="source changed during copy",
                 )
 
             shutil.copystat(source, temp_path)
 
-            if checkhash:
-                try:
-                    destination_hash = sha256_file(temp_path, cancel_event=cancel_event)
-                except InterruptedError:
-                    self._safe_unlink(temp_path)
+            if checkhash and not verify_after_copy:
+                # Batch mode: the digest was computed while the bytes streamed past,
+                # so the destination only needs to be re-read once the job is done.
+                if _source_stat_changed(source_stat, source.stat()):
+                    self._release_temporary(
+                        temp_path, plan, destination, offset=bytes_done, keep_partial=False
+                    )
                     return VerifiedCopy(
                         ok=False,
                         hash_ok=None,
                         bytes_copied=bytes_done,
+                        resumed_bytes=resumed_bytes,
+                        error="source changed during copy",
+                    )
+                os.replace(temp_path, destination)
+                self._discard_partial_meta(plan, destination)
+                if durable_writes:
+                    self._fsync_directory_best_effort(destination.parent)
+                return VerifiedCopy(
+                    ok=True,
+                    hash_ok=None,
+                    bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
+                    source_digest=source_digest.hexdigest() if source_digest else None,
+                )
+
+            if checkhash:
+                try:
+                    destination_hash = self._digest_path(
+                        temp_path, hash_method, cancel_event
+                    )
+                except InterruptedError:
+                    self._release_temporary(
+                        temp_path, plan, destination, offset=bytes_done, keep_partial=True
+                    )
+                    return VerifiedCopy(
+                        ok=False,
+                        hash_ok=None,
+                        bytes_copied=bytes_done,
+                        resumed_bytes=resumed_bytes,
                         cancelled=True,
                         error="cancelled",
                     )
@@ -1954,60 +2531,166 @@ class CopyEngine:
                 verified = temp_path.stat().st_size == source_size
 
             if _source_stat_changed(source_stat, source.stat()):
-                self._safe_unlink(temp_path)
+                self._release_temporary(
+                    temp_path, plan, destination, offset=bytes_done, keep_partial=False
+                )
                 return VerifiedCopy(
                     ok=False,
                     hash_ok=False if checkhash else None,
                     bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
                     error="source changed during copy",
                 )
 
             if cancel_event.is_set():
-                self._safe_unlink(temp_path)
+                self._release_temporary(
+                    temp_path, plan, destination, offset=bytes_done, keep_partial=True
+                )
                 return VerifiedCopy(
                     ok=False,
                     hash_ok=None,
                     bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
                     cancelled=True,
                     error="cancelled",
                 )
             if not verified:
-                self._safe_unlink(temp_path)
+                self._release_temporary(
+                    temp_path, plan, destination, offset=bytes_done, keep_partial=False
+                )
                 return VerifiedCopy(
                     ok=False,
                     hash_ok=False if checkhash else None,
                     bytes_copied=bytes_done,
+                    resumed_bytes=resumed_bytes,
                     error="verification failed",
                 )
             os.replace(temp_path, destination)
+            self._discard_partial_meta(plan, destination)
             if durable_writes:
                 self._fsync_directory_best_effort(destination.parent)
             return VerifiedCopy(
-                ok=True, hash_ok=True if checkhash else None, bytes_copied=bytes_done
+                ok=True,
+                hash_ok=True if checkhash else None,
+                bytes_copied=bytes_done,
+                resumed_bytes=resumed_bytes,
             )
         except PermissionError as exc:
-            if temp_path is not None:
-                self._safe_unlink(temp_path)
+            self._release_temporary(
+                temp_path, plan, destination, offset=bytes_done, keep_partial=False
+            )
             return VerifiedCopy(
                 ok=False,
                 hash_ok=None,
                 bytes_copied=bytes_done,
+                resumed_bytes=resumed_bytes,
                 error=_friendly_permission_error(exc),
             )
         except Exception as exc:  # noqa: BLE001
-            if temp_path is not None:
-                self._safe_unlink(temp_path)
+            self._release_temporary(
+                temp_path, plan, destination, offset=bytes_done, keep_partial=False
+            )
             return VerifiedCopy(
                 ok=False,
                 hash_ok=None,
                 bytes_copied=bytes_done,
+                resumed_bytes=resumed_bytes,
                 error=_friendly_exception_error(exc),
             )
 
     @staticmethod
-    def _copy_failure_reason(copy_result: VerifiedCopy, checkhash: bool) -> str:
+    def _rebuild_digest(
+        path: Path,
+        digest,  # noqa: ANN001 - hashlib/xxhash incremental object
+        offset: int,
+        cancel_event: Event,
+    ) -> int | None:
+        """Re-hash the bytes already written, returning ``None`` when cancelled.
+
+        The returned value is the number of bytes actually hashed, which is used
+        as the resume offset so a partially flushed buffer can never make the
+        copy skip unwritten data.
+        """
+        bytes_done = 0
+        try:
+            handle = path.open("rb")
+        except OSError:
+            return bytes_done
+        with handle:
+            while bytes_done < offset:
+                if cancel_event.is_set():
+                    return None
+                chunk = handle.read(min(COPY_CHUNK_SIZE, offset - bytes_done))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                bytes_done += len(chunk)
+        return bytes_done
+
+    def _log_resumed_partial(
+        self,
+        callbacks: CopyCallbacks,
+        source: Path,
+        bytes_done: int,
+        source_size: int,
+        source_total_bytes: int,
+        source_done_bytes: int,
+        file_index: int,
+    ) -> None:
+        callbacks.emit_byte_progress(bytes_done, source_size, file_index)
+        if source_total_bytes > 0:
+            callbacks.emit_source_progress(
+                source_done_bytes + bytes_done, source_total_bytes, True
+            )
+        logger.info(
+            "Continuing partial copy of %s at %s of %s bytes",
+            source,
+            bytes_done,
+            source_size,
+        )
+
+    def _release_temporary(
+        self,
+        temp_path: Path | None,
+        plan: PartialPlan | None,
+        destination: Path,
+        *,
+        offset: int,
+        keep_partial: bool,
+    ) -> None:
+        """Remove the temporary file, or keep it so a later run can continue."""
+        if plan is not None:
+            finish_partial(destination, offset=offset, keep=keep_partial)
+            self._note_partial(destination, keep=keep_partial)
+            return
+        if temp_path is not None:
+            self._safe_unlink(temp_path)
+
+    def _discard_partial_meta(self, plan: PartialPlan | None, destination: Path) -> None:
+        if plan is not None:
+            finish_partial(destination, offset=0, keep=False)
+            self._note_partial(destination, keep=False)
+
+    def _note_partial(self, destination: Path, *, keep: bool) -> None:
+        """Track partial files in the journal so a discarded session cleans up."""
+        session = self._session
+        store = self._session_store
+        if session is None or store is None:
+            return
+        data = partial_paths(destination).data
+        if keep:
+            store.add_partial(session, data)
+        else:
+            store.remove_partial(session, data)
+
+    @staticmethod
+    def _copy_failure_reason(
+        copy_result: VerifiedCopy, checkhash: bool, hash_method: str = "sha256"
+    ) -> str:
         if copy_result.hash_ok is False:
-            return "SHA256 FAILED" if checkhash else "verification failed"
+            if checkhash:
+                return f"{hash_failure_label(hash_method).upper()} FAILED"
+            return "verification failed"
         return copy_result.error or "copy failed"
 
     @staticmethod
@@ -2199,6 +2882,7 @@ class CopyEngine:
         self, callbacks: CopyCallbacks, report: CopyReport, result: FileCopyResult
     ) -> None:
         report.add_result(result)
+        self._record_session_result(result)
         callbacks.emit_result(result)
         message = result_message(result)
         message_type = classify_file_result(result)

@@ -31,6 +31,10 @@ def format_risk_warning_paragraphs(
     if kept_existing_count:
         paragraphs.append(_volume_mismatch_kept_existing_warning(kept_existing_count))
 
+    batch_failed = counts.get("batch_verification_failed", 0)
+    if batch_failed:
+        paragraphs.append(_batch_verification_warning(batch_failed))
+
     return paragraphs
 
 
@@ -106,4 +110,17 @@ def _volume_mismatch_kept_existing_warning(count: int) -> str:
         f"{count} files found only on the second-source volume were not copied "
         "because the existing destinations were kept.\n"
         "The differing files remain only on this volume and will be erased."
+    )
+
+
+def _batch_verification_warning(count: int) -> str:
+    if count == 1:
+        return (
+            "1 copied file failed batch verification and does not match its source.\n"
+            "The source file was kept and will be erased by formatting."
+        )
+    return (
+        f"{count} copied files failed batch verification and do not match their "
+        "sources.\n"
+        "Those source files were kept and will be erased by formatting."
     )

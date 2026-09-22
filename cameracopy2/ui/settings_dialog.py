@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from typing import cast
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,19 +30,24 @@ from PySide6.QtWidgets import (
 )
 
 from cameracopy2 import __version__
+from cameracopy2 import i18n
 from cameracopy2.config import (
     normalize_source_subfolder,
     validate_folder_component,
     validate_relative_source,
 )
 from cameracopy2.core.log_messages import LogMessageType
+from cameracopy2.core.hash import hash_method_available
 from cameracopy2.core.metadata_diagnostics import diagnose_files, format_diagnostics_report
 from cameracopy2.core.naming import preview_destination
 from cameracopy2.core.source_paths import resolve_source_root
 from cameracopy2.models import (
     CameraCopyConfig,
     CollisionPolicy,
+    HashMethod,
+    LanguageMode,
     ThemeMode,
+    VerificationMode,
     VolumeInfo,
     VolumeMatch,
     VolumeMatchMethod,
@@ -80,6 +85,25 @@ DATE_PRESETS = [
     ("No date folder", ""),
     ("Custom", None),
 ]
+
+_HASH_METHOD_HELP = (
+    "SHA-256: most compatible — any tool can re-check it, which suits long-term "
+    "archives; slower because it is CPU-bound.\n"
+    "xxHash64: fastest — several times quicker on large cards; non-cryptographic, so "
+    "fewer external tools support it."
+)
+
+_VERIFY_MODE_HELP: dict[str, str] = {
+    "per_file": (
+        "Each file right after it is copied: a file that fails its check never reaches "
+        "the destination, and the problem is reported while that file is still on screen."
+    ),
+    "batch": (
+        "All files after the whole batch: copying runs uninterrupted and throughput is "
+        "smoother on slow media, but problems surface later. With source removal "
+        "enabled, files are deleted only after every check has passed."
+    ),
+}
 
 
 class _CompactForm(QWidget):
@@ -226,6 +250,8 @@ def set_form_row_tooltip(
 
 
 class SettingsDialog(QDialog):
+    language_changed = Signal(str)
+
     def __init__(
         self,
         config: CameraCopyConfig,
@@ -585,8 +611,26 @@ class SettingsDialog(QDialog):
         separator.setStyleSheet("font-weight: 600;")
         layout.addFullRow(separator)
 
-        self.hash_checkbox = QCheckBox("Verify copied files with SHA256")
+        self.hash_checkbox = QCheckBox("Verify copied files against the source")
         self.hash_checkbox.setChecked(self._config.checkhash)
+        self.hash_combo = QComboBox()
+        self.hash_combo.addItem("SHA-256 — universally compatible", "sha256")
+        self.hash_combo.addItem("xxHash64 — fastest, non-cryptographic", "xxhash64")
+        self._set_combo_by_data(self.hash_combo, self._config.hashmethod)
+        self.hash_method_help = QLabel(_HASH_METHOD_HELP)
+        self.hash_method_help.setWordWrap(True)
+        self.hash_native_warning = QLabel(
+            "The optional xxhash acceleration module is not installed, so xxHash64 will "
+            "run as a pure-Python fallback that is much slower than SHA-256. Install it "
+            "with: pip install xxhash"
+        )
+        self.hash_native_warning.setWordWrap(True)
+        self.verify_mode_combo = QComboBox()
+        self.verify_mode_combo.addItem("Each file right after it is copied", "per_file")
+        self.verify_mode_combo.addItem("All files after the whole batch", "batch")
+        self._set_combo_by_data(self.verify_mode_combo, self._config.verificationmode)
+        self.verify_mode_help = QLabel()
+        self.verify_mode_help.setWordWrap(True)
         self.hash_warning_label = QLabel(
             "Verification is disabled. CameraCopy will not confirm that copied file "
             "contents match the source. Source removal and formatting will have reduced "
@@ -602,18 +646,49 @@ class SettingsDialog(QDialog):
         self._set_combo_by_data(self.collision_combo, self._config.collisionpolicy)
         self.autoremove_checkbox = QCheckBox("Remove source files after successful copy")
         self.autoremove_checkbox.setChecked(self._config.autoremove)
+        self.resume_partial_checkbox = QCheckBox("Resume interrupted file copies")
+        self.resume_partial_checkbox.setChecked(self._config.resumepartialfiles)
 
         layout.addRow("Verification:", self.hash_checkbox)
+        layout.addRow("Hash method:", self.hash_combo)
+        layout.addHelpRow(self.hash_method_help)
+        layout.addHelpRow(self.hash_native_warning)
+        layout.addRow("Verify timing:", self.verify_mode_combo)
+        layout.addHelpRow(self.verify_mode_help)
         layout.addHelpRow(self.hash_warning_label)
         layout.addRow("Sidecars:", self.copy_sidecars_checkbox)
         layout.addRow("Existing files:", self.collision_combo)
         layout.addRow("Source cleanup:", self.autoremove_checkbox)
+        layout.addRow("Interrupted files:", self.resume_partial_checkbox)
+        set_form_row_tooltip(
+            layout,
+            self.resume_partial_checkbox,
+            "Continue a file that an interrupted copy already started.",
+            "CameraCopy keeps the partially written data in the destination and "
+            "continues it on the next attempt instead of transferring the whole "
+            "file again. A partial file is only continued when it still belongs "
+            "to the exact source file it was copied from.",
+        )
         set_form_row_tooltip(
             layout,
             self.hash_checkbox,
-            "Compare SHA256 hashes of source and destination after copying.",
+            "Compare a hash of the source and destination after copying.",
             "When disabled, normal copies use a basic size check. Clone verification "
-            "always uses SHA256.",
+            "always hashes the compared files.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.hash_combo,
+            "Choose the hash algorithm used for verification.",
+            "SHA-256 is the most compatible choice and can be re-checked with external "
+            "tools. xxHash64 is much faster but is not a cryptographic hash.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.verify_mode_combo,
+            "Choose when destination files are hashed.",
+            "Each file verifies as soon as it is written. All files defers every check "
+            "until the copy has finished, which keeps writing uninterrupted.",
         )
         set_form_row_tooltip(
             layout,
@@ -629,6 +704,8 @@ class SettingsDialog(QDialog):
         self._collision_form = layout
         self.collision_combo.currentIndexChanged.connect(self._update_collision_tooltip)
         self.hash_checkbox.toggled.connect(self._refresh_inline_warnings)
+        self.hash_combo.currentIndexChanged.connect(self._refresh_inline_warnings)
+        self.verify_mode_combo.currentIndexChanged.connect(self._refresh_inline_warnings)
         self._update_collision_tooltip()
 
         layout.finish()
@@ -738,6 +815,18 @@ class SettingsDialog(QDialog):
             "Choose the application appearance or follow the operating-system theme.",
         )
 
+        self.language_combo = QComboBox()
+        for code, label in i18n.LANGUAGE_LABELS:
+            self.language_combo.addItem(label, code)
+        self._set_combo_by_data(self.language_combo, self._config.language)
+        layout.addRow("Language:", self.language_combo)
+        set_form_row_tooltip(
+            layout,
+            self.language_combo,
+            "Choose the language used by the CameraCopy interface.",
+        )
+        self.language_combo.currentIndexChanged.connect(self._language_changed)
+
         heading = QLabel("Copy log colors")
         heading.setStyleSheet("font-weight: 600;")
         layout.addFullRow(heading)
@@ -820,6 +909,14 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(tab, "Appearance")
         self._update_log_preview()
 
+    def _language_changed(self) -> None:
+        language = str(self.language_combo.currentData() or i18n.DEFAULT_LANGUAGE)
+        if language == i18n.get_language():
+            return
+        i18n.set_language(language)
+        i18n.retranslate_all()
+        self.language_changed.emit(language)
+
     def _reset_log_colors(self) -> None:
         for control in self.log_color_controls.values():
             control.set_value(None)
@@ -879,7 +976,19 @@ class SettingsDialog(QDialog):
 
         if hasattr(self, "hash_warning_label"):
             self.hash_warning_label.setStyleSheet(warning_style)
-            self.hash_warning_label.setVisible(not self.hash_checkbox.isChecked())
+            verification_enabled = self.hash_checkbox.isChecked()
+            self.hash_warning_label.setVisible(not verification_enabled)
+            hash_method = str(self.hash_combo.currentData() or "sha256")
+            verify_mode = str(self.verify_mode_combo.currentData() or "per_file")
+            for widget in (self.hash_combo, self.verify_mode_combo):
+                widget.setEnabled(verification_enabled)
+            self.hash_method_help.setEnabled(verification_enabled)
+            self.verify_mode_help.setEnabled(verification_enabled)
+            self.verify_mode_help.setText(_VERIFY_MODE_HELP.get(verify_mode, ""))
+            self.hash_native_warning.setStyleSheet(warning_style)
+            self.hash_native_warning.setVisible(
+                verification_enabled and not hash_method_available(hash_method)
+            )
         if hasattr(self, "durable_writes_warning_label"):
             self.durable_writes_warning_label.setStyleSheet(warning_style)
             self.durable_writes_warning_label.setVisible(
@@ -911,6 +1020,8 @@ class SettingsDialog(QDialog):
         self.format_prompt_checkbox.setChecked(self._config.formatprompt)
         self.durable_writes_checkbox = QCheckBox("Flush copied files to disk after writing")
         self.durable_writes_checkbox.setChecked(self._config.durablewrites)
+        self.recover_jobs_checkbox = QCheckBox("Recover interrupted copy jobs")
+        self.recover_jobs_checkbox.setChecked(self._config.recoverinterruptedjobs)
         self.durable_writes_warning_label = QLabel(
             "Durable writes are disabled. Copying may finish before all data has been "
             "committed to the destination device. Source removal and formatting will "
@@ -927,6 +1038,15 @@ class SettingsDialog(QDialog):
         layout.addHelpRow(format_warning)
         layout.addRow("Durable writes:", self.durable_writes_checkbox)
         layout.addHelpRow(self.durable_writes_warning_label)
+        layout.addRow("Interrupted copies:", self.recover_jobs_checkbox)
+        recovery_help = QLabel(
+            "CameraCopy records which source files have already been preserved. "
+            "After a cancelled copy, a crash, or a power failure it can rebuild the "
+            "same job and continue with the remaining files. The record is stored "
+            "outside the destination folder and is deleted as soon as the copy "
+            "finishes successfully."
+        )
+        layout.addHelpRow(recovery_help)
         set_form_row_tooltip(
             layout,
             self.format_combo,
@@ -951,6 +1071,13 @@ class SettingsDialog(QDialog):
             "Flush each copied file to storage before verification and request a "
             "destination-folder flush after renaming.",
             "This is slower but more conservative.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.recover_jobs_checkbox,
+            "Save the state of a running copy so it can be continued later.",
+            "Nothing is written to the source or destination volumes; the record only "
+            "lists the files that have already been preserved.",
         )
         self.durable_writes_checkbox.toggled.connect(self._refresh_inline_warnings)
 
@@ -1323,6 +1450,12 @@ class SettingsDialog(QDialog):
         )
         return primary_match, secondary_match
 
+    def _selected_language(self) -> str:
+        combo = getattr(self, "language_combo", None)
+        if combo is None:
+            return self._config.language
+        return str(combo.currentData() or i18n.DEFAULT_LANGUAGE)
+
     def _config_from_controls(self) -> CameraCopyConfig:
         if self.date_preset_combo.currentData() is None:
             date_format = self.custom_date_edit.text().strip()
@@ -1352,7 +1485,13 @@ class SettingsDialog(QDialog):
             autoremove=self.autoremove_checkbox.isChecked(),
             formatprompt=self.format_prompt_checkbox.isChecked(),
             checkhash=self.hash_checkbox.isChecked(),
+            hashmethod=cast(HashMethod, str(self.hash_combo.currentData() or "sha256")),
+            verificationmode=cast(
+                VerificationMode, str(self.verify_mode_combo.currentData() or "per_file")
+            ),
             durablewrites=self.durable_writes_checkbox.isChecked(),
+            resumepartialfiles=self.resume_partial_checkbox.isChecked(),
+            recoverinterruptedjobs=self.recover_jobs_checkbox.isChecked(),
             fixsonytimestamps=self.fix_sony_checkbox.isChecked(),
             collisionpolicy=collision_policy,
             applicationname=self.application_name_edit.text().strip(),
@@ -1360,6 +1499,7 @@ class SettingsDialog(QDialog):
             applicationarguments=self.application_arguments_edit.text().strip(),
             applicationenvironment=self.application_environment_edit.text().strip(),
             theme=cast(ThemeMode, str(self.theme_combo.currentData())),
+            language=cast(LanguageMode, self._selected_language()),
             copyloginformationcolor=self.log_color_controls[
                 LogMessageType.INFORMATION
             ].value(),

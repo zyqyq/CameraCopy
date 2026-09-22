@@ -65,7 +65,7 @@ from cameracopy2.models import (
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
-    ReportFormat,
+
     RenameDateSource,
     ThemeMode,
     VerificationMode,
@@ -1432,23 +1432,22 @@ class SettingsDialog(QDialog):
             "Automatically write a report when a copy task finishes.",
         )
 
-        self.report_format_combo = QComboBox()
-        self.report_format_combo.addItem(
-            "CSV — opens in Excel and most spreadsheet tools", "csv"
-        )
-        self.report_format_combo.addItem(
-            "HTML — a self-contained page that opens in any browser", "html"
-        )
-        self.report_format_combo.addItem(
-            "PDF — a formatted report for archiving or handing over", "pdf"
-        )
-        self._set_combo_by_data(self.report_format_combo, self._config.reportformat)
-        layout.addRow("Report format:", self.report_format_combo)
-        set_help_tooltip(
-            self.report_format_combo,
-            "Format used when a report is exported automatically. The Export report "
-            "button lets you pick a format each time.",
-        )
+        self.report_format_checks: dict[str, QCheckBox] = {}
+        format_descriptions = {
+            "csv": "CSV — opens in Excel and most spreadsheet tools",
+            "html": "HTML — a self-contained page that opens in any browser",
+            "pdf": "PDF — a formatted report for archiving or handing over",
+        }
+        for fmt in ("csv", "html", "pdf"):
+            box = QCheckBox(format_descriptions[fmt])
+            box.setChecked(fmt in self._config.reportformats)
+            set_help_tooltip(
+                box,
+                "One report is exported automatically per checked format. The "
+                "Export report button lets you pick a format each time.",
+            )
+            self.report_format_checks[fmt] = box
+            layout.addFullRow(box)
 
         self.report_directory_edit = QLineEdit(self._config.reportdirectory)
         report_browse_button = QPushButton("Browse…")
@@ -1918,9 +1917,12 @@ class SettingsDialog(QDialog):
             copylogerrorcolor=self.log_color_controls[LogMessageType.ERROR].value(),
             copylogbackgroundcolor=self.log_background_control.value(),
             reportexport=self.report_export_checkbox.isChecked(),
-            reportformat=cast(
-                ReportFormat, str(self.report_format_combo.currentData() or "csv")
-            ),
+            reportformats=[
+                fmt
+                for fmt in ("csv", "html", "pdf")
+                if self.report_format_checks[fmt].isChecked()
+            ]
+            or ["csv"],
             reportdirectory=self.report_directory_edit.text().strip(),
             reportfields=self._selected_report_fields(),
             reportincludesummary=self.report_include_summary_checkbox.isChecked(),

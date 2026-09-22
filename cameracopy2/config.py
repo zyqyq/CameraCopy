@@ -19,7 +19,7 @@ from .models import (
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
-    ReportFormat,
+
     FolderTreeMode,
     RenameDateSource,
     ThemeMode,
@@ -164,7 +164,9 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         raise UnsupportedConfigError(f"Unsupported config version: {data.get('version')!r}")
 
     allowed_keys = {field.name for field in fields(CameraCopyConfig)}
-    legacy_ignored_keys = {"verifycloneskippedfiles"}
+    # Keys an old config may still carry; they are either ignored or
+    # consumed by a migration reader (reportformat -> reportformats).
+    legacy_ignored_keys = {"verifycloneskippedfiles", "reportformat"}
     unknown_keys = set(data) - allowed_keys - legacy_ignored_keys
     if unknown_keys:
         raise UnsupportedConfigError(f"Unknown config field(s): {', '.join(sorted(unknown_keys))}")
@@ -256,7 +258,7 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
             data, "copylogbackgroundcolor", default.copylogbackgroundcolor
         ),
         reportexport=_read_bool(data, "reportexport", default.reportexport),
-        reportformat=_read_report_format(data, default.reportformat),
+        reportformats=_read_report_formats(data, default.reportformats),
         reportdirectory=_read_str(data, "reportdirectory", default.reportdirectory),
         reportfields=_read_report_fields(data, default.reportfields),
         reportincludesummary=_read_bool(
@@ -375,13 +377,36 @@ def _read_redundant_write_mode(
     return cast(RedundantWriteMode, value)
 
 
-def _read_report_format(data: dict[str, Any], default: ReportFormat) -> ReportFormat:
-    if "reportformat" not in data:
-        return default
-    value = data["reportformat"]
-    if not isinstance(value, str) or value not in _ALLOWED_REPORT_FORMATS:
-        raise UnsupportedConfigError("reportformat must be csv, html, or pdf.")
-    return cast(ReportFormat, value)
+def _read_report_formats(data: dict[str, Any], default: list[str]) -> list[str]:
+    """Read the selected report formats, newest key first.
+
+    ``reportformats`` is the multi-format list; the legacy single-string
+    ``reportformat`` key of older configs is migrated into a one-item list.
+    The returned list always follows the canonical csv/html/pdf order.
+    """
+    raw: Any
+    if "reportformats" in data:
+        raw = data["reportformats"]
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or not all(isinstance(value, str) for value in raw)
+        ):
+            raise UnsupportedConfigError(
+                "reportformats must be a non-empty list of csv, html, or pdf."
+            )
+    elif "reportformat" in data:
+        raw = [data["reportformat"]]
+    else:
+        return list(default)
+    for value in raw:
+        if value not in _ALLOWED_REPORT_FORMATS:
+            raise UnsupportedConfigError(
+                "reportformats entries must be csv, html, or pdf."
+            )
+    # Canonical order, duplicates removed.
+    selected = set(raw)
+    return [fmt for fmt in ("csv", "html", "pdf") if fmt in selected]
 
 
 def _read_report_fields(data: dict[str, Any], default: list[str]) -> list[str]:

@@ -195,7 +195,9 @@ class CameraCopyConfig:
     copylogerrorcolor: str | None = None
     copylogbackgroundcolor: str | None = None
     reportexport: bool = False
-    reportformat: ReportFormat = "csv"
+    # One report is exported automatically per selected format; at least
+    # one format is always active (validation keeps the list non-empty).
+    reportformats: list[str] = field(default_factory=lambda: ["csv"])
     reportdirectory: str = ""
     reportfields: list[str] = field(default_factory=lambda: list(DEFAULT_REPORT_FIELDS))
     reportincludesummary: bool = True

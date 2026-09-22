@@ -838,8 +838,8 @@ TRANSLATIONS: dict[str, str] = {
     "Report fields": "报告字段",
     "Choose which columns the exported report contains.":
         "选择导出的报告包含哪些列。",
-    "Format used when a report is exported automatically. The Export report button lets you pick a format each time.":
-        "自动导出报告时使用的格式；用「导出报告」按钮可以每次自行选择格式。",
+    "One report is exported automatically per checked format. The Export report button lets you pick a format each time.":
+        "勾选的每种格式都会自动导出一份报告；用「导出报告」按钮可以每次自行选择格式。",
     "Include summary in the report": "报告中包含摘要",
     "Include the per-task summary in exported reports.":
         "导出的报告中包含任务摘要。",

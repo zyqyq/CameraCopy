@@ -899,7 +899,7 @@ class CopyProgressDialog(QDialog):
             return
         suffix = Path(chosen).suffix.lower().lstrip(".")
         if suffix not in {"csv", "html", "pdf"}:
-            chosen = str(Path(chosen).with_suffix(f".{config.reportformat}"))
+            chosen = str(Path(chosen).with_suffix(f".{config.reportformats[0]}"))
         self._export_report(Path(chosen))
 
     def _auto_export_report(self) -> None:
@@ -910,12 +910,17 @@ class CopyProgressDialog(QDialog):
         directory = resolve_report_directory(config, self.report)
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            target = build_export_path(directory, self.report, config.reportformat)
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Report export failed: {exc}", "ERROR")
             return
-        self.append_log(f"Automatic report export: {Path(target).name}")
-        self._export_report(target, quiet=True)
+        for file_format in config.reportformats or ["csv"]:
+            try:
+                target = build_export_path(directory, self.report, file_format)
+            except Exception as exc:  # noqa: BLE001
+                self.append_log(f"Report export failed: {exc}", "ERROR")
+                continue
+            self.append_log(f"Automatic report export: {Path(target).name}")
+            self._export_report(target, quiet=True)
 
     def _export_report(self, output_path: Path, *, quiet: bool = False) -> None:
         report = self.report
@@ -923,7 +928,8 @@ class CopyProgressDialog(QDialog):
             return
         config = self.job.config
         options = ReportExportOptions(
-            file_format=output_path.suffix.lower().lstrip(".") or config.reportformat,
+            file_format=output_path.suffix.lower().lstrip(".")
+            or config.reportformats[0],
             fields=list(config.reportfields),
             include_summary=config.reportincludesummary,
             include_log=config.reportincludelog,

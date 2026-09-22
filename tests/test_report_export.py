@@ -300,7 +300,7 @@ def test_config_roundtrip_report_fields(tmp_path: Path) -> None:
 
     config = CameraCopyConfig(
         reportexport=True,
-        reportformat="html",
+        reportformats=["html", "csv"],
         reportdirectory=str(tmp_path / "reports"),
         reportfields=["source", "status", "backups"],
         reportincludesummary=False,
@@ -310,7 +310,8 @@ def test_config_roundtrip_report_fields(tmp_path: Path) -> None:
     save_config(config, path)
     loaded = load_config(path)
     assert loaded.reportexport is True
-    assert loaded.reportformat == "html"
+    # canonical csv-first order is restored on load
+    assert loaded.reportformats == ["csv", "html"]
     assert loaded.reportdirectory == str(tmp_path / "reports")
     # canonical order is restored on load
     assert loaded.reportfields == ["source", "status", "backups"]
@@ -321,6 +322,20 @@ def test_config_roundtrip_report_fields(tmp_path: Path) -> None:
 def test_config_rejects_bad_report_format() -> None:
     with pytest.raises(UnsupportedConfigError, match="reportformat"):
         config_from_dict({"version": 2, "reportformat": "xlsx"})
+    with pytest.raises(UnsupportedConfigError, match="reportformats"):
+        config_from_dict({"version": 2, "reportformats": ["xlsx"]})
+    with pytest.raises(UnsupportedConfigError, match="reportformats"):
+        config_from_dict({"version": 2, "reportformats": []})
+
+
+def test_config_migrates_legacy_single_report_format() -> None:
+    config = config_from_dict({"version": 2, "reportformat": "pdf"})
+    assert config.reportformats == ["pdf"]
+
+
+def test_config_report_formats_deduplicate_and_reorder() -> None:
+    config = config_from_dict({"version": 2, "reportformats": ["pdf", "csv", "pdf"]})
+    assert config.reportformats == ["csv", "pdf"]
 
 
 def test_config_drops_unknown_report_field_keys() -> None:
@@ -362,7 +377,7 @@ def test_settings_report_tab_roundtrip(qapp, tmp_path: Path) -> None:  # noqa: A
 
     config = CameraCopyConfig(
         reportexport=True,
-        reportformat="pdf",
+        reportformats=["pdf"],
         reportdirectory=str(tmp_path),
         reportfields=["source", "backups"],
         reportincludesummary=False,
@@ -373,14 +388,18 @@ def test_settings_report_tab_roundtrip(qapp, tmp_path: Path) -> None:  # noqa: A
     assert "Report" in tab_texts
 
     assert dialog.report_export_checkbox.isChecked()
-    assert str(dialog.report_format_combo.currentData()) == "pdf"
+    assert dialog.report_format_checks["pdf"].isChecked()
+    assert not dialog.report_format_checks["csv"].isChecked()
+    assert not dialog.report_format_checks["html"].isChecked()
     assert dialog.report_directory_edit.text() == str(tmp_path)
     assert dialog.report_include_summary_checkbox.isChecked() is False
     assert dialog.report_include_log_checkbox.isChecked() is True
 
     # change controls and read them back through _config_from_controls
     dialog.report_export_checkbox.setChecked(False)
-    dialog.report_format_combo.setCurrentIndex(0)  # csv
+    dialog.report_format_checks["pdf"].setChecked(False)
+    dialog.report_format_checks["csv"].setChecked(True)
+    dialog.report_format_checks["html"].setChecked(True)
     dialog.report_directory_edit.setText(str(tmp_path / "elsewhere"))
     for index in range(dialog.report_fields_list.count()):
         item = dialog.report_fields_list.item(index)
@@ -393,7 +412,7 @@ def test_settings_report_tab_roundtrip(qapp, tmp_path: Path) -> None:  # noqa: A
 
     updated = dialog._config_from_controls()  # noqa: SLF001
     assert updated.reportexport is False
-    assert updated.reportformat == "csv"
+    assert updated.reportformats == ["csv", "html"]
     assert updated.reportdirectory == str(tmp_path / "elsewhere")
     assert updated.reportfields == ["status", "rating"]
     assert updated.reportincludesummary is True
@@ -431,7 +450,7 @@ def test_progress_dialog_exports_manually_and_automatically(
         source="",
         destination=str(tmp_path / "pictures"),
         reportexport=True,
-        reportformat="csv",
+        reportformats=["csv"],
         reportdirectory=str(tmp_path / "reports"),
     )
     job_copy = {
@@ -471,6 +490,41 @@ def test_progress_dialog_exports_manually_and_automatically(
     qapp.processEvents()
 
 
+def test_progress_dialog_exports_every_selected_format(
+    qapp, tmp_path: Path
+) -> None:  # noqa: ARG001
+    i18n.set_language("en")
+    from cameracopy2.models import CopyJob
+    from cameracopy2.ui.copy_progress_dialog import CopyProgressDialog
+
+    config = CameraCopyConfig(
+        source="",
+        destination=str(tmp_path / "pictures"),
+        reportexport=True,
+        reportformats=["csv", "html", "pdf"],
+        reportdirectory=str(tmp_path / "reports"),
+    )
+    job = CopyJob(
+        primary=VolumeInfo(
+            id="card", display_name="Card", mount_path=tmp_path / "card"
+        ),
+        secondary=None,
+        config=config,
+    )
+    dialog = CopyProgressDialog(job)
+    dialog.report = _make_report()
+    dialog._finish_all_operations()  # noqa: SLF001
+    dialog.close()
+    qapp.processEvents()
+
+    reports = tmp_path / "reports"
+    stamp = "CameraCopy report 2026-09-22 13-45-00"
+    for suffix in ("csv", "html", "pdf"):
+        assert (reports / f"{stamp}.{suffix}").exists(), f"missing {suffix} report"
+    log_text = dialog.log_view.toPlainText()
+    assert log_text.count("Automatic report export") == 3
+
+
 def test_progress_dialog_reports_export_errors(
     qapp, tmp_path: Path, monkeypatch
 ) -> None:  # noqa: ARG001
@@ -486,7 +540,7 @@ def test_progress_dialog_reports_export_errors(
     config = CameraCopyConfig(
         source="",
         destination=str(tmp_path / "pictures"),
-        reportformat="csv",
+        reportformats=["csv"],
         reportfields=["not_a_field"],  # type: ignore[list-item]
     )
     job = CopyJob(
@@ -636,7 +690,7 @@ def test_auto_export_writes_into_destination_date_folder(
         source="",
         destination=str(dest),
         reportexport=True,
-        reportformat="csv",
+        reportformats=["csv"],
         reportdirectory="",
     )
     job = CopyJob(

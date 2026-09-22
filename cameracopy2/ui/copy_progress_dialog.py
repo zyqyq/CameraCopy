@@ -21,11 +21,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from cameracopy2.core.copy_engine import BATCH_VERIFY_ACTION
+from cameracopy2.core.copy_engine import BATCH_VERIFY_ACTION, remove_source_file
+from cameracopy2 import i18n
 from cameracopy2.core.format_warnings import (
     format_risk_warning_paragraphs,
     irreversible_format_warning,
 )
+from cameracopy2.core.copy_messages import format_log_file_size
 from cameracopy2.core.log_messages import LogMessageType, classify_log_message
 from cameracopy2.core.report_export import (
     ReportExportOptions,
@@ -785,10 +787,86 @@ class CopyProgressDialog(QDialog):
         )
         self.export_report_button.setEnabled(self.report is not None)
         self.close_button.setEnabled(True)
+        self._confirm_pending_source_removal()
         self._auto_export_report()
         if self.operation_log is not None:
             self.operation_log.info("All copy and format operations finished")
             self.operation_log.close()
+
+    def _confirm_pending_source_removal(self) -> None:
+        """Ask before deleting the source files the engine parked for us."""
+        report = self.report
+        if report is None or not report.pending_source_removals:
+            return
+        entries = list(report.pending_source_removals)
+        total_bytes = sum(size for _path, size in entries)
+        size_text = format_log_file_size(total_bytes)
+        # Translate the pieces first, then assemble the rich text: the full
+        # HTML string must not go through the automatic setText interception
+        # (it would never match a TRANSLATIONS entry).
+        question = i18n.translate_text(
+            f"The copy finished successfully. Delete {len(entries)} source "
+            f"file(s) ({size_text}) from the card?"
+        )
+        warning = i18n.translate_text("Deleted files cannot be recovered.")
+        scope_note = i18n.translate_text(
+            "Only files that were copied and verified are affected."
+        )
+        copies_note = i18n.translate_text("The copies on the destination stay.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(i18n.translate_text("Confirm source deletion"))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(f"<b>{question}</b>")
+        box.setInformativeText(
+            f'<span style="color:#e53935;"><b>&#9888; {warning}</b></span><br>'
+            f"&bull; {scope_note}<br>"
+            f"&bull; {copies_note}"
+        )
+        delete_button = box.addButton(
+            "Delete source files", QMessageBox.ButtonRole.AcceptRole
+        )
+        delete_button.setStyleSheet("color:#c62828; font-weight:bold;")
+        keep_button = box.addButton(
+            "Keep source files", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(keep_button)
+        box.exec()
+
+        if box.clickedButton() is not delete_button:
+            report.removal_confirmed = False
+            message = (
+                f"Kept {len(entries)} source file(s); deletion cancelled."
+            )
+            report.add_log(message)
+            self.append_log(message, "WARNING")
+            return
+
+        removed = 0
+        removed_bytes = 0
+        failures: list[tuple[Path, str]] = []
+        for source, size in entries:
+            error = remove_source_file(source)
+            if error is None:
+                removed += 1
+                removed_bytes += size
+            else:
+                failures.append((source, error))
+        report.removal_confirmed = True
+        report.confirmed_removals = removed
+        report.confirmed_removal_bytes = removed_bytes
+        message = (
+            f"Deleted {removed} source file(s) after confirmation "
+            f"({format_log_file_size(removed_bytes)})."
+        )
+        if failures:
+            message += f" {len(failures)} file(s) could not be deleted."
+        report.add_log(message)
+        self.append_log(message, "INFO" if not failures else "WARNING")
+        for source, error in failures:
+            failure_line = f"SOURCE REMOVAL FAILED: {source} — {error}"
+            report.add_log(failure_line)
+            self.append_log(failure_line, "ERROR")
 
     def export_report_dialog(self) -> None:
         """Ask for a location and export the finished report manually."""

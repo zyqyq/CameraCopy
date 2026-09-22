@@ -19,6 +19,7 @@ from cameracopy2.core.report_export import (
 from cameracopy2.models import (
     DEFAULT_REPORT_FIELDS,
     CameraCopyConfig,
+    CopyJob,
     CopyReport,
     FileCopyResult,
     ReplicaResult,
@@ -507,3 +508,75 @@ def test_progress_dialog_reports_export_errors(
 
     dialog.close()
     qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# resolve_report_directory: default = destination top level
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_report_directory_prefers_explicit_setting(tmp_path: Path) -> None:
+    from cameracopy2.core.report_export import resolve_report_directory
+
+    custom = tmp_path / "custom"
+    config = CameraCopyConfig(
+        source="",
+        destination=str(tmp_path / "pictures"),
+        reportdirectory=str(custom),
+    )
+    assert resolve_report_directory(config) == custom
+
+
+def test_resolve_report_directory_defaults_to_destination_top_level(
+    tmp_path: Path,
+) -> None:
+    from cameracopy2.core.report_export import resolve_report_directory
+
+    config = CameraCopyConfig(
+        source="",
+        destination=str(tmp_path / "pictures"),
+        reportdirectory="  ",
+    )
+    assert resolve_report_directory(config) == tmp_path / "pictures"
+
+
+def test_resolve_report_directory_without_destination_falls_back(
+    tmp_path: Path,
+) -> None:
+    from cameracopy2.core.report_export import (
+        default_report_directory,
+        resolve_report_directory,
+    )
+
+    config = CameraCopyConfig(source="", destination="")
+    assert resolve_report_directory(config) == default_report_directory()
+
+
+def test_auto_export_writes_to_destination_top_level(qapp, tmp_path: Path) -> None:  # noqa: ARG001
+    dest = tmp_path / "pictures"
+    config = CameraCopyConfig(
+        source="",
+        destination=str(dest),
+        reportexport=True,
+        reportformat="csv",
+        reportdirectory="",
+    )
+    job = CopyJob(
+        primary=VolumeInfo(
+            id="card", display_name="Card", mount_path=tmp_path / "card"
+        ),
+        secondary=None,
+        config=config,
+    )
+    from cameracopy2.ui.copy_progress_dialog import CopyProgressDialog
+
+    dialog = CopyProgressDialog(job)
+    dialog.report = _make_report()
+    dialog._finish_all_operations()  # noqa: SLF001
+    dialog.close()
+    qapp.processEvents()
+
+    reports = list(dest.glob("CameraCopy report *.csv"))
+    assert reports, "the report must land in the destination top level"
+    # 不落进任何按日期/层级组织的子文件夹
+    assert all(report.parent == dest for report in reports)

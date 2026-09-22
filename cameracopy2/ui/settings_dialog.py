@@ -1460,7 +1460,8 @@ class SettingsDialog(QDialog):
         set_form_row_tooltip(
             layout,
             self.report_directory_edit,
-            "Reports are written here automatically; leave empty to ask each time.",
+            "Reports are written here automatically; leave empty to use "
+            "the top level of the destination folder.",
         )
 
         fields_heading = QLabel("Report fields")

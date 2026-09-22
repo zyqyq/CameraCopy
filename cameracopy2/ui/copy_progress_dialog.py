@@ -32,7 +32,7 @@ from cameracopy2.core.log_messages import LogMessageType, classify_log_message
 from cameracopy2.core.report_export import (
     ReportExportOptions,
     build_export_path,
-    default_report_directory,
+    resolve_report_directory,
     export_copy_report,
 )
 from cameracopy2.core.resume import CopySessionStore
@@ -874,9 +874,9 @@ class CopyProgressDialog(QDialog):
         if report is None:
             return
         config = self.job.config
-        directory = config.reportdirectory.strip() or str(default_report_directory())
+        directory = resolve_report_directory(config)
         try:
-            Path(directory).mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
             suggested = build_export_path(directory, report, config.reportformat)
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Report export failed: {exc}", "ERROR")
@@ -899,9 +899,9 @@ class CopyProgressDialog(QDialog):
         config = self.job.config
         if not config.reportexport or self.report is None:
             return
-        directory = config.reportdirectory.strip() or str(default_report_directory())
+        directory = resolve_report_directory(config)
         try:
-            Path(directory).mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
             target = build_export_path(directory, self.report, config.reportformat)
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Report export failed: {exc}", "ERROR")

@@ -825,8 +825,9 @@ TRANSLATIONS: dict[str, str] = {
     "PDF — a formatted report for archiving or handing over":
         "PDF — 适合存档或交付的排版报告",
     "Report folder:": "报告文件夹：",
-    "Reports are written here automatically; leave empty to ask each time.":
-        "自动导出的报告写入此处；留空则每次询问。",
+    "Reports are written here automatically; leave empty to use "
+    "the top level of the destination folder.":
+        "自动导出的报告写入此处；留空则导出到目标文件夹的最高层级。",
     "Choose a report folder": "选择报告文件夹",
     "Report fields:": "报告字段：",
     "Report fields": "报告字段",

@@ -300,3 +300,20 @@ def default_report_directory() -> Path:
     from cameracopy2.config import APP_NAME
 
     return Path.home() / "Documents" / f"{APP_NAME} reports"
+
+
+def resolve_report_directory(config) -> Path:
+    """Return the folder reports should be written to.
+
+    An explicit ``reportdirectory`` wins. Otherwise the report goes to the
+    top level of the copy destination — regardless of which folder tree
+    mode is active, sub-folders only organize the copied files, never the
+    report. Without a destination configured, fall back to Documents.
+    """
+    configured = config.reportdirectory.strip()
+    if configured:
+        return Path(configured).expanduser()
+    destination = config.destination.strip()
+    if destination:
+        return Path(destination).expanduser()
+    return default_report_directory()

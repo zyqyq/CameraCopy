@@ -9,7 +9,7 @@ from threading import Event
 from dateutil import parser as date_parser
 
 from cameracopy2.core.sidecars import SidecarIndex
-from cameracopy2.services.metadata_service import ExifToolService
+from cameracopy2.services.metadata_service import TIMESTAMP_TAGS, ExifToolService
 
 SONY_MP4_RE = re.compile(r"^C\d{4,}\.MP4$", re.IGNORECASE)
 CREATION_DATE_RE = re.compile(
@@ -20,6 +20,26 @@ XMP_DATE_ATTR_RE = re.compile(
     r"(?:CreateDate|DateCreated|DateTimeOriginal)\s*=\s*[\"'](?P<dt>[^\"']+)[\"']",
     re.IGNORECASE,
 )
+
+#: ExifTool tags behind each selectable "rename files from metadata" date source.
+#: ``same_as_folder`` and ``file_mtime`` are resolved without ExifTool, so they
+#: are intentionally absent.
+RENAME_DATE_TAGS: dict[str, tuple[str, ...]] = {
+    "exif_datetime_original": ("EXIF:DateTimeOriginal", "DateTimeOriginal"),
+    "exif_create_date": ("EXIF:CreateDate", "CreateDate"),
+    "quicktime_create_date": (
+        "QuickTime:CreateDate",
+        "QuickTime:MediaCreateDate",
+        "MediaCreateDate",
+        "TrackCreateDate",
+        "CreateDate",
+    ),
+    "xmp_create_date": (
+        "XMP:CreateDate",
+        "XMP:DateCreated",
+        "XMP-photoshop:DateCreated",
+    ),
+}
 
 
 def sony_xml_candidate(mp4_path: Path) -> Path:
@@ -83,6 +103,25 @@ class TimestampResolver:
     def warm_cache(self, paths: list[Path], *, cancel_event: Event | None = None) -> None:
         self.exiftool.warm_cache(paths, cancel_event=cancel_event)
 
+    def warm_rename_cache(
+        self,
+        paths: list[Path],
+        date_source: str,
+        *,
+        cancel_event: Event | None = None,
+    ) -> None:
+        """Batch-read folder timestamps and the rename date source in one pass.
+
+        Warming a single union of tags matters: the cache only answers a read
+        when it already holds every tag that read asks for, so two narrow
+        warmups would still cost one ExifTool run per file.
+        """
+        tags = list(TIMESTAMP_TAGS)
+        for tag in RENAME_DATE_TAGS.get(str(date_source or ""), ()):
+            if tag not in tags:
+                tags.append(tag)
+        self.exiftool.warm_cache(paths, tags, cancel_event=cancel_event)
+
     def resolve(
         self,
         path: Path,
@@ -107,3 +146,28 @@ class TimestampResolver:
             return sidecar_timestamp, "xmp_sidecar"
 
         return datetime.fromtimestamp(path.stat().st_mtime), "file_mtime"
+
+    def resolve_rename_date(
+        self,
+        path: Path,
+        date_source: str,
+        *,
+        fallback: datetime,
+    ) -> tuple[datetime, str]:
+        """Resolve the date used to rename one copied file.
+
+        ``fallback`` is the folder-naming timestamp. It is used when the chosen
+        source has no usable value, so a file is always renamed instead of
+        silently keeping its camera name.
+        """
+        path = Path(path)
+        if date_source == "same_as_folder":
+            return fallback, "folder_date"
+        if date_source == "file_mtime":
+            return datetime.fromtimestamp(path.stat().st_mtime), "file_mtime"
+        tags = RENAME_DATE_TAGS.get(date_source)
+        if tags:
+            embedded = self.exiftool.read_capture_timestamp(path, tags)
+            if embedded is not None:
+                return embedded, date_source
+        return fallback, "folder_date"

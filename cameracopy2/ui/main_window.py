@@ -125,6 +125,8 @@ class MainWindow(QMainWindow):
 
         self.clone_checkbox = QCheckBox("Second volume is a clone of first")
         self.clone_checkbox.setChecked(self.config.clonemode)
+        self.rename_checkbox = QCheckBox("Rename files from metadata")
+        self.rename_checkbox.setChecked(self.config.renamefiles)
         self.autoremove_checkbox = QCheckBox("Remove source files after successful copy")
         self.autoremove_checkbox.setChecked(self.config.autoremove)
 
@@ -199,6 +201,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.addRow("Clone mode:", self.clone_checkbox)
+        form.addRow("File renaming:", self.rename_checkbox)
         form.addRow("After successful copy:", self.autoremove_checkbox)
         form.addRow("Format after copy:", self.format_combo)
         form.addRow(self._summary_row())
@@ -209,6 +212,12 @@ class MainWindow(QMainWindow):
             "CameraCopy copies from the first volume, then hash-verifies matching "
             "files on the second. Files found only on the second volume are reviewed "
             "separately.",
+        )
+        set_form_row_tooltip(
+            form,
+            self.rename_checkbox,
+            "Rename copied files from their capture metadata.",
+            "Configure the naming rules in Settings on the Naming and metadata tab.",
         )
         set_form_row_tooltip(
             form,
@@ -827,6 +836,7 @@ class MainWindow(QMainWindow):
             return
 
         format_value = self.format_combo.currentData()
+        self.config.renamefiles = self.rename_checkbox.isChecked()
         provisional_job = CopyJob(
             primary=primary,
             secondary=secondary,
@@ -850,11 +860,12 @@ class MainWindow(QMainWindow):
         )
         operation_log.info(
             "Pre-copy scan requested; primary=%s secondary=%s destination=%s clone=%s "
-            "autoremove=%s format=%s verify=%s hash=%s timing=%s durable_writes=%s",
+            "rename=%s autoremove=%s format=%s verify=%s hash=%s timing=%s durable_writes=%s",
             primary.display_name,
             secondary.display_name if secondary is not None else "none",
             self.config.destination,
             self.clone_checkbox.isChecked(),
+            self.config.renamefiles,
             self.autoremove_checkbox.isChecked(),
             format_value if isinstance(format_value, str) else "none",
             self.config.checkhash,
@@ -981,6 +992,7 @@ class MainWindow(QMainWindow):
             self.primary_combo,
             self.secondary_combo,
             self.clone_checkbox,
+            self.rename_checkbox,
             self.autoremove_checkbox,
             self.format_combo,
             self.settings_button,

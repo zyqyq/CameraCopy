@@ -262,9 +262,17 @@ class ExifToolService:
                 return rating
         return None
 
-    def read_capture_timestamp(self, path: Path) -> datetime | None:
-        data = self.read_json(path, TIMESTAMP_TAGS)
-        for tag in TIMESTAMP_TAGS:
+    def read_capture_timestamp(
+        self, path: Path, tags: list[str] | tuple[str, ...] | None = None
+    ) -> datetime | None:
+        """Return the first usable capture timestamp.
+
+        ``tags`` narrows the lookup, which is how the "rename files from
+        metadata" date source asks for one specific EXIF/QuickTime field.
+        """
+        wanted = tuple(tags) if tags else TIMESTAMP_TAGS
+        data = self.read_json(path, wanted)
+        for tag in wanted:
             value = _get_metadata_value(data, tag)
             if not value:
                 continue

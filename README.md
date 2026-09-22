@@ -14,7 +14,12 @@ cleanup, and guarded post-copy formatting.<br>
 - Copy from one or two mounted volumes.
 - Dual-volume clone verification with mismatch handling.
 - Recursive scanning with configurable include and exclude patterns.
-- Date-based destination folders with configurable naming.
+- Date-based destination folders with configurable naming, plus two "today"
+  folder tree modes: wrap the capture-date folders in an extra current-date
+  folder, or put every file of one copy task into a single current-date folder.
+- Optional renaming of copied files from capture metadata, with a flexible
+  `{token}` pattern (for example `{date}-{name}` turns `DJI0001.MP4` into
+  `202601012000-DJI0001.MP4`; `*` keeps the original file name).
 - Ratings from Adobe XMP and RapidRaw `.rrdata` sidecars.
 - Optional embedded ratings and timestamps through ExifTool.
 - Optional copying of matching XMP and RapidRaw sidecars.
@@ -113,7 +118,7 @@ cameracopy
 1. Open **Settings**.
 2. Set the source subfolder, commonly `DCIM`, or leave it empty to scan the selected volume root.
 3. Choose the destination folder and file patterns.
-4. Configure folder naming, metadata, verification, sidecar, and collision options.
+4. Configure folder naming, file renaming, metadata, verification, sidecar, and collision options.
 5. Select the first source volume in the main window.
 6. Optionally select a second volume and enable clone mode.
 7. Start the copy and review the final summary before removing or formatting media.

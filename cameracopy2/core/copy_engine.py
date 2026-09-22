@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from dateutil import parser as date_parser
 from pathlib import Path
 from threading import Event, Lock
 from typing import Literal
@@ -24,7 +25,13 @@ from cameracopy2.core.hash import (
     sha256_file,
 )
 from cameracopy2.core.log_messages import classify_file_result, classify_log_message
-from cameracopy2.core.naming import build_destination_file
+from cameracopy2.core.naming import (
+    build_destination_file,
+    effective_rename_pattern,
+    folder_tree_mode,
+    folder_tree_mode_label,
+    rename_date_source_label,
+)
 from cameracopy2.core.rating_reader import RatingReader
 from cameracopy2.core.resume import (
     CopySession,
@@ -39,7 +46,7 @@ from cameracopy2.core.resume import (
 from cameracopy2.core.scanner import find_candidate_files
 from cameracopy2.core.sidecars import SidecarIndex, SidecarMatch, is_sidecar_path
 from cameracopy2.core.source_paths import resolve_source_root
-from cameracopy2.core.timestamp_resolver import TimestampResolver
+from cameracopy2.core.timestamp_resolver import RENAME_DATE_TAGS, TimestampResolver
 from cameracopy2.services.metadata_service import ExifToolService
 from cameracopy2.models import (
     CameraCopyConfig,
@@ -62,6 +69,14 @@ CloneRole = Literal["normal", "primary", "secondary"]
 CloneInventoryState = Literal["selected", "rating_excluded", "skipped"]
 
 BATCH_VERIFY_ACTION = "Batch verification"
+
+
+def _parse_task_time(value: str) -> datetime | None:
+    """Parse a session ``created_at`` stamp back into the task timestamp."""
+    try:
+        return date_parser.parse(str(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 #: Number of already-copied files folded into one progress update when an
 #: interrupted job is resumed, so a large card stays responsive.
@@ -216,6 +231,7 @@ class CopyEngine:
         # Parallel replicas share the copy journal, so partial-file bookkeeping
         # is serialised even though the file transfers themselves run at once.
         self._partial_meta_lock = Lock()
+        self._task_time: datetime | None = None
         if rating_reader is None and timestamp_resolver is None:
             exiftool = ExifToolService()
             self.rating_reader = RatingReader(exiftool)
@@ -237,6 +253,9 @@ class CopyEngine:
         callbacks = callbacks or CopyCallbacks()
         cancel_event = cancel_event or Event()
         report = CopyReport(started_at=datetime.now())
+        # One "today" reference per copy task: every file of the same run —
+        # and of a later resume of the same session — shares this timestamp.
+        self._task_time = report.started_at
         report.hash_method = job.config.hashmethod
         report.verification_mode = job.config.verificationmode
         self._batch_entries = []
@@ -353,6 +372,12 @@ class CopyEngine:
             resumed = session is not None
         if session is None:
             session = store.create(job)
+        else:
+            # Resuming an interrupted job keeps its original "today" folder:
+            # destinations must stay identical to the interrupted run.
+            resumed_task_time = _parse_task_time(session.created_at)
+            if resumed_task_time is not None:
+                self._task_time = resumed_task_time
         self._session = session
         report.session_id = session.session_id
         self._log(callbacks, report, f"Copy session: {session.session_id}")
@@ -510,6 +535,12 @@ class CopyEngine:
         self._log(
             callbacks, report, f"Starting copy from {source_text} to {job.config.destination}"
         )
+        if folder_tree_mode(job.config) != "capture_date":
+            self._log(
+                callbacks,
+                report,
+                f"Folder tree: {folder_tree_mode_label(folder_tree_mode(job.config))}",
+            )
         self._log(
             callbacks,
             report,
@@ -536,11 +567,21 @@ class CopyEngine:
             self._log(callbacks, report, self._redundant_backup_log_line(job.config))
         if job.config.minrating > 0:
             self._log(callbacks, report, f"Minimum rating: {job.config.minrating}")
+        if job.config.renamefiles:
+            self._log(callbacks, report, f"Rename files: {self._rename_summary(job.config)}")
         cleanup = (
             "remove after successful copy" if job.autoremove else "leave source files in place"
         )
         self._log(callbacks, report, f"Source cleanup: {cleanup}")
         self._log(callbacks, report, "")
+
+    @staticmethod
+    def _rename_summary(config: CameraCopyConfig) -> str:
+        """One log line describing the active rename scheme."""
+        return (
+            f"{effective_rename_pattern(config)} "
+            f"(date from {rename_date_source_label(config.renamefiledatesource)})"
+        )
 
     @staticmethod
     def _collision_policy_label(policy: CollisionPolicy) -> str:
@@ -1714,6 +1755,7 @@ class CopyEngine:
                 media_destination,
                 media_context,
                 config,
+                self._task_time,
             )
             result = self._copy_context(
                 context,
@@ -2449,17 +2491,28 @@ class CopyEngine:
     def _warm_metadata_cache(
         self, files: list[Path], config: CameraCopyConfig, cancel_event: Event
     ) -> None:
-        if not config.useembeddedmetadata:
+        if not config.useembeddedmetadata and not self._rename_needs_metadata(config):
             return
         warmed_services: set[int] = set()
-        if config.minrating > 0:
+        if config.useembeddedmetadata and config.minrating > 0:
             self.rating_reader.warm_cache(files, cancel_event=cancel_event)
             warmed_services.add(id(self.rating_reader.exiftool))
-        if (
-            self._date_folder_enabled(config)
-            and id(self.timestamp_resolver.exiftool) not in warmed_services
-        ):
+        if id(self.timestamp_resolver.exiftool) in warmed_services:
+            return
+        if self._rename_needs_metadata(config):
+            self.timestamp_resolver.warm_rename_cache(
+                files, config.renamefiledatesource, cancel_event=cancel_event
+            )
+        elif self._date_folder_enabled(config):
             self.timestamp_resolver.warm_cache(files, cancel_event=cancel_event)
+
+    @staticmethod
+    def _rename_needs_metadata(config: CameraCopyConfig) -> bool:
+        """True when the chosen rename date can only come from ExifTool."""
+        return bool(
+            config.renamefiles
+            and RENAME_DATE_TAGS.get(str(config.renamefiledatesource or ""))
+        )
 
     def _build_file_context(
         self,
@@ -2475,7 +2528,18 @@ class CopyEngine:
         else:
             rating, rating_source = None, None
         timestamp, timestamp_source = self._resolve_timestamp(source, config, sidecars)
-        destination = build_destination_file(config, source, timestamp)
+        task_time = self._task_time if self._task_time is not None else datetime.now()
+        # "Same as folder" must mean the folder the file actually lands in:
+        # in today-only mode that folder carries the task date, not the
+        # capture date.
+        folder_time = task_time if folder_tree_mode(config) == "today_only" else timestamp
+        destination = build_destination_file(
+            config,
+            source,
+            timestamp,
+            self._resolve_rename_date(source, config, folder_time),
+            task_time,
+        )
         return FileContext(
             source=source,
             destination=destination,
@@ -2517,6 +2581,22 @@ class CopyEngine:
             use_embedded_metadata=config.useembeddedmetadata,
             sidecars=sidecars,
         )
+
+    def _resolve_rename_date(
+        self,
+        source: Path,
+        config: CameraCopyConfig,
+        folder_timestamp: datetime,
+    ) -> datetime | None:
+        """Date used in the target file name, or None while renaming is off."""
+        if not config.renamefiles:
+            return None
+        rename_date, _source = self.timestamp_resolver.resolve_rename_date(
+            source,
+            config.renamefiledatesource,
+            fallback=folder_timestamp,
+        )
+        return rename_date
 
     @staticmethod
     def _build_sidecar_map(
@@ -2566,6 +2646,7 @@ class CopyEngine:
         media_destination: Path | None,
         media_context: FileContext | None,
         config: CameraCopyConfig,
+        task_time: datetime | None = None,
     ) -> FileContext:
         if media_context is not None and media_destination is not None:
             return CopyEngine._build_sidecar_context(
@@ -2581,7 +2662,7 @@ class CopyEngine:
         timestamp = datetime.fromtimestamp(source.stat().st_mtime)
         return FileContext(
             source=source,
-            destination=build_destination_file(config, source, timestamp),
+            destination=build_destination_file(config, source, timestamp, task_time=task_time),
             rating=None,
             rating_source=None,
             timestamp=timestamp,
@@ -3021,6 +3102,10 @@ class CopyEngine:
 
     @staticmethod
     def _date_folder_enabled(config: CameraCopyConfig) -> bool:
+        # Today-only folders depend on the task clock, never on capture time,
+        # so warming capture timestamps for folder naming would be wasted work.
+        if folder_tree_mode(config) == "today_only":
+            return False
         return bool(config.datetimestring or config.folderprefix or config.folderpostfix)
 
     def _read_rating(

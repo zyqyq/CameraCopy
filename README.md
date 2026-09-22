@@ -27,6 +27,11 @@ cleanup, and guarded post-copy formatting.<br>
 - Interrupted-copy recovery: the state of a running copy is recorded outside the
   destination, so the same job can be restarted and only the remaining files are copied.
 - Optional source cleanup after successful preservation.
+- Copy reports: export a finished task as CSV (opens in Excel), HTML, or PDF.
+  Pick which columns the report contains (source, destination, status, size,
+  bytes written, verification, rating, capture timestamp, redundant backups,
+  failure reason), optionally include the summary and the copy log, and let
+  CameraCopy write a report automatically after every copy.
 - Guarded formatting after a clean copy operation.
 - Per-operation logs, progress, transfer speed, ETA, and cancellation.
 - System, light, and dark themes with customizable copy output colors.

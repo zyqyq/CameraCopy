@@ -10,6 +10,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -26,6 +27,12 @@ from cameracopy2.core.format_warnings import (
     irreversible_format_warning,
 )
 from cameracopy2.core.log_messages import LogMessageType, classify_log_message
+from cameracopy2.core.report_export import (
+    ReportExportOptions,
+    build_export_path,
+    default_report_directory,
+    export_copy_report,
+)
 from cameracopy2.core.resume import CopySessionStore
 from cameracopy2.core.transfer_rate import TransferRateEstimator
 from cameracopy2.models import CopyJob, CopyReport, FileCopyResult
@@ -96,6 +103,8 @@ class CopyProgressDialog(QDialog):
         self.cancel_button = QPushButton("Cancel")
         self.open_destination_button = QPushButton("Open destination")
         self.open_destination_button.setEnabled(False)
+        self.export_report_button = QPushButton("Export report")
+        self.export_report_button.setEnabled(False)
         button_text = application_button_text(self.job.config).replace("&", "&&")
         self.open_application_button = QPushButton(button_text)
         self.open_application_button.setVisible(
@@ -106,6 +115,10 @@ class CopyProgressDialog(QDialog):
             self.open_application_button,
             application_button_tooltip(self.job.config),
         )
+        set_help_tooltip(
+            self.export_report_button,
+            "Export the report of this copy task as CSV, HTML or PDF.",
+        )
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
 
@@ -113,6 +126,7 @@ class CopyProgressDialog(QDialog):
         row.addWidget(self.cancel_button)
         row.addStretch(1)
         row.addWidget(self.open_destination_button)
+        row.addWidget(self.export_report_button)
         row.addWidget(self.open_application_button)
         row.addWidget(self.close_button)
 
@@ -129,6 +143,7 @@ class CopyProgressDialog(QDialog):
 
         self.cancel_button.clicked.connect(self.request_cancel)
         self.open_destination_button.clicked.connect(self.open_destination)
+        self.export_report_button.clicked.connect(self.export_report_dialog)
         self.open_application_button.clicked.connect(self.open_configured_application)
         self.close_button.clicked.connect(self.accept)
 
@@ -768,10 +783,79 @@ class CopyProgressDialog(QDialog):
         self.open_application_button.setEnabled(
             application_integration_configured(self.job.config)
         )
+        self.export_report_button.setEnabled(self.report is not None)
         self.close_button.setEnabled(True)
+        self._auto_export_report()
         if self.operation_log is not None:
             self.operation_log.info("All copy and format operations finished")
             self.operation_log.close()
+
+    def export_report_dialog(self) -> None:
+        """Ask for a location and export the finished report manually."""
+        report = self.report
+        if report is None:
+            return
+        config = self.job.config
+        directory = config.reportdirectory.strip() or str(default_report_directory())
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            suggested = build_export_path(directory, report, config.reportformat)
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"Report export failed: {exc}", "ERROR")
+            return
+        chosen, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export report",
+            str(suggested),
+            "CSV (*.csv);;HTML (*.html);;PDF (*.pdf)",
+        )
+        if not chosen:
+            return
+        suffix = Path(chosen).suffix.lower().lstrip(".")
+        if suffix not in {"csv", "html", "pdf"}:
+            chosen = str(Path(chosen).with_suffix(f".{config.reportformat}"))
+        self._export_report(Path(chosen))
+
+    def _auto_export_report(self) -> None:
+        """Write the report without asking when the config requests it."""
+        config = self.job.config
+        if not config.reportexport or self.report is None:
+            return
+        directory = config.reportdirectory.strip() or str(default_report_directory())
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            target = build_export_path(directory, self.report, config.reportformat)
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"Report export failed: {exc}", "ERROR")
+            return
+        self.append_log(f"Automatic report export: {Path(target).name}")
+        self._export_report(target, quiet=True)
+
+    def _export_report(self, output_path: Path, *, quiet: bool = False) -> None:
+        report = self.report
+        if report is None:
+            return
+        config = self.job.config
+        options = ReportExportOptions(
+            file_format=output_path.suffix.lower().lstrip(".") or config.reportformat,
+            fields=list(config.reportfields),
+            include_summary=config.reportincludesummary,
+            include_log=config.reportincludelog,
+        )
+        try:
+            written = export_copy_report(report, options, output_path)
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"Report export failed: {exc}", "ERROR")
+            if not quiet:
+                QMessageBox.warning(
+                    self, "Report export failed", f"{output_path}\n\n{exc}"
+                )
+            return
+        self.append_log(f"Report exported: {written}")
+        if not quiet:
+            QMessageBox.information(
+                self, "Report exported successfully", str(written)
+            )
 
     def _confirm_format(self, target, filesystem: str) -> bool:  # noqa: ANN001 - Qt-facing helper
         size_text = (

@@ -788,6 +788,72 @@ TRANSLATIONS: dict[str, str] = {
     "Interrupted copy stopped; it can be resumed later.":
         "中断的复制已停止，之后可以继续。",
     "Bytes continued from partial files": "断点续传已写入的字节",
+    # --- Report export -----------------------------------------------------
+    "Report": "报告",
+    "Export report": "导出报告",
+    "Export the report of this copy task as CSV, HTML or PDF.":
+        "将本次复制任务的报告导出为 CSV、HTML 或 PDF。",
+    "Export a report after each copy finishes": "每次复制完成后自动导出报告",
+    "Automatically write a report when a copy task finishes.":
+        "复制任务结束时自动写出一份报告。",
+    "Report format:": "报告格式：",
+    "CSV — opens in Excel and most spreadsheet tools":
+        "CSV — 可用 Excel 等表格工具打开",
+    "HTML — a self-contained page that opens in any browser":
+        "HTML — 自包含页面，可在任意浏览器打开",
+    "PDF — a formatted report for archiving or handing over":
+        "PDF — 适合存档或交付的排版报告",
+    "Report folder:": "报告文件夹：",
+    "Reports are written here automatically; leave empty to ask each time.":
+        "自动导出的报告写入此处；留空则每次询问。",
+    "Choose a report folder": "选择报告文件夹",
+    "Report fields:": "报告字段：",
+    "Report fields": "报告字段",
+    "Choose which columns the exported report contains.":
+        "选择导出的报告包含哪些列。",
+    "Format used when a report is exported automatically. The Export report button lets you pick a format each time.":
+        "自动导出报告时使用的格式；用「导出报告」按钮可以每次自行选择格式。",
+    "Include summary in the report": "报告中包含摘要",
+    "Include the per-task summary in exported reports.":
+        "导出的报告中包含任务摘要。",
+    "Include log in the report": "报告中包含日志",
+    "Include the full copy log in exported reports.":
+        "导出的报告中包含完整复制日志。",
+    "CameraCopy report": "CameraCopy 拷卡报告",
+    "Task information": "任务信息",
+    "Summary": "摘要",
+    "Copy log": "复制日志",
+    "Started at": "开始时间",
+    "Finished at": "结束时间",
+    "Total files": "文件总数",
+    "Hash method": "校验算法",
+    "Verification mode": "校验时机",
+    "Source path": "源路径",
+    "Destination path": "目标路径",
+    "File size (bytes)": "文件大小（字节）",
+    "Verification result": "校验结果",
+    "Rating": "评分",
+    "Captured timestamp": "拍摄时间",
+    "Failure reason": "失败原因",
+    "Verified": "已通过",
+    "Hash mismatch": "哈希不一致",
+    "Not verified": "未校验",
+    "Copied": "已复制",
+    "Overwrote": "已覆盖",
+    "Kept both (renamed)": "双方保留（已重命名）",
+    "Verified existing": "既有文件已校验",
+    "Clone verified": "克隆已校验",
+    "Kept both (clone)": "双方保留（克隆）",
+    "Replaced (clone)": "已替换（克隆）",
+    "Skipped (clone)": "已跳过（克隆）",
+    "Kept both": "双方保留",
+    "Replaced": "已替换",
+    "Kept existing": "保留既有文件",
+    "Skipped": "已跳过",
+    "Removed": "已删除",
+    "Failed": "失败",
+    "Report exported successfully": "报告导出成功",
+    "Report export failed": "报告导出失败",
 }
 
 
@@ -1024,6 +1090,27 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
         r"^(.+?): ((\d[\d,]*) (?:written|verified existing|skipped|failed)"
         r"(?:, \d[\d,]* (?:written|verified existing|skipped|failed))*)$",
         _redundant_backup_line_rule,
+    ),
+    # report export ---------------------------------------------------------
+    (
+        r"^Backup OK \((\d+)/(\d+)\)$",
+        lambda m: f"备份正常（{m.group(1)}/{m.group(2)}）",
+    ),
+    (
+        r"^Backup incomplete \((\d+)/(\d+)\)$",
+        lambda m: f"备份未完成（{m.group(1)}/{m.group(2)}）",
+    ),
+    (
+        r"^Report exported: (.+)$",
+        lambda m: f"报告已导出：{m.group(1)}",
+    ),
+    (
+        r"^Report export failed: (.+)$",
+        lambda m: f"报告导出失败：{m.group(1)}",
+    ),
+    (
+        r"^Automatic report export: (.+)$",
+        lambda m: f"自动导出报告：{m.group(1)}",
     ),
 ]
 
@@ -1583,6 +1670,7 @@ def retranslate_all() -> None:
             QGroupBox,
             QLabel,
             QLineEdit,
+            QListWidget,
             QPlainTextEdit,
             QTabWidget,
         )
@@ -1637,6 +1725,20 @@ def retranslate_all() -> None:
                 _orig["plain_setPlainText"](widget, translate_block(english))
             except Exception:
                 pass
+
+        # QListWidget items filled with translatable English headers (report
+        # field picker): the widget stores the English source list as a
+        # property because QListWidget is not intercepted by the Qt patches.
+        source_items = widget.property("_i18n_listitems")
+        if isinstance(source_items, list) and isinstance(widget, QListWidget):
+            for index, item_text in enumerate(source_items):
+                if index >= widget.count():
+                    break
+                item = widget.item(index)
+                try:
+                    item.setText(translate_text(str(item_text)))
+                except Exception:  # pragma: no cover
+                    break
 
         if isinstance(widget, QComboBox) and "combo_setItemText" in _orig:
             for index in range(widget.count()):

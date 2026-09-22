@@ -281,7 +281,9 @@ def test_main_and_settings_help_text(tmp_path: Path) -> None:
         "and successfully verified."
     )
     assert dialog.copy_sidecars_checkbox.isChecked()
-    assert dialog.height() == 680
+    # The dialog sizes itself to the tallest tab, clamped to the screen, so the
+    # exact height depends on the display; it must never open below its minimum.
+    assert dialog.height() >= dialog.minimumHeight() >= 520
     assert ".rrdata" in dialog.rating_help_label.text()
     assert dialog.metadata_diagnostics_button.text() == "Run metadata diagnostics"
     diagnostics_tooltip = dialog.metadata_diagnostics_button.toolTip()
@@ -293,6 +295,45 @@ def test_main_and_settings_help_text(tmp_path: Path) -> None:
 
     dialog.close()
     window.close()
+    app.processEvents()
+
+
+def test_settings_pattern_editors_never_overlap(tmp_path: Path) -> None:
+    """Include/Exclude keep their input row below the list at every window size.
+
+    Regression: the Files tab asked for more height than the dialog gave it, the
+    tab was squeezed below its minimum, and the pattern list was drawn on top of
+    its own input row (hiding the row of Add/Remove controls and the last rows of
+    the tab). Now the tab scrolls instead of squeezing.
+    """
+    app = _app()
+    for width, height in ((880, 760), (860, 680), (640, 520), (1024, 620)):
+        dialog = SettingsDialog(CameraCopyConfig(), volumes=[])
+        files_tab = next(
+            index
+            for index in range(dialog.tabs.count())
+            if dialog.tabs.tabText(index) == "Files"
+        )
+        dialog.tabs.setCurrentIndex(files_tab)
+        dialog.resize(width, height)
+        dialog.show()
+        app.processEvents()
+
+        for editor in (dialog.include_editor, dialog.exclude_editor):
+            list_bottom = editor.list_widget.y() + editor.list_widget.height()
+            assert list_bottom <= editor.input.y(), (
+                f"pattern list overlaps its input row at {width}x{height}"
+            )
+            assert editor.height() >= editor.minimumSizeHint().height()
+
+        # Content that does not fit must scroll rather than be clipped away.
+        page = dialog.tabs.currentWidget()
+        content = page.widget()
+        assert content.height() <= page.viewport().height() or (
+            page.verticalScrollBar().isVisible()
+        )
+
+        dialog.close()
     app.processEvents()
 
 

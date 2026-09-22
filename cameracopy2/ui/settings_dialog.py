@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLayout,
@@ -20,11 +21,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
-    QTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpacerItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -104,6 +106,11 @@ _VERIFY_MODE_HELP: dict[str, str] = {
         "enabled, files are deleted only after every check has passed."
     ),
 }
+
+
+# Height the dialog spends on the tab bar, the preview label, the button row
+# and the layout margins, on top of the tab content itself.
+_DIALOG_CHROME_HEIGHT = 150
 
 
 class _CompactForm(QWidget):
@@ -209,16 +216,22 @@ class _CompactForm(QWidget):
 
 
 def _create_form_tab() -> tuple[QWidget, _CompactForm]:
-    """Create a tab with one form that fills the bordered tab area."""
-    tab = QWidget()
-    tab.setMinimumSize(0, 0)
+    """Create a scrollable tab holding one form.
 
-    tab_layout = QVBoxLayout(tab)
-    tab_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
-
+    The form keeps the height its rows actually need. When the window is too
+    short for that, the tab scrolls instead of squeezing the rows into each
+    other (which used to draw the pattern editor's list on top of its own
+    input row and clip the last rows of the tab).
+    """
     form = _CompactForm()
-    tab_layout.addWidget(form, 1)
-    return tab, form
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setWidget(form)
+    return scroll, form
 
 
 def set_form_row_tooltip(
@@ -260,7 +273,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("CameraCopy Settings")
-        self.resize(860, 680)
+        self.setMinimumSize(640, 520)
         self._config = config
         self._all_volumes = list(volumes or [])
         self._volumes = self._filter_volumes(self._config.includeddevices)
@@ -300,11 +313,30 @@ class SettingsDialog(QDialog):
         footer.addWidget(buttons)
 
         layout = QVBoxLayout(self)
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.addWidget(self.tabs, 1)
         layout.addWidget(self.preview_label)
         layout.addLayout(footer)
         self._update_preview()
+        self.resize(880, self._preferred_height())
+
+    def _preferred_height(self) -> int:
+        """Dialog height that shows the tallest tab without a scroll bar.
+
+        Clamped to the available screen so the dialog never opens taller than
+        the display; shorter windows fall back to scrolling the tab.
+        """
+        tallest = 0
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            inner = page.widget() if isinstance(page, QScrollArea) else page
+            if inner is not None:
+                tallest = max(tallest, inner.sizeHint().height())
+
+        wanted = tallest + _DIALOG_CHROME_HEIGHT
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            wanted = min(wanted, screen.availableGeometry().height() - 80)
+        return max(560, wanted)
 
     def _build_source_tab(self) -> None:
         tab, form = _create_form_tab()

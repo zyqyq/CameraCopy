@@ -637,6 +637,15 @@ TRANSLATIONS: dict[str, str] = {
     "Copy time": "复制耗时",
     "Average write speed": "平均写入速度",
     "Redundant bytes written": "冗余备份写入字节",
+    "Redundant backup destinations": "冗余备份目标",
+    "enabled, but no folder is configured": "已启用，但未配置任何文件夹",
+    "redundant backup incomplete": "冗余备份未完成",
+    "redundant backup incomplete; source kept": "冗余备份未完成，已保留源文件",
+    "redundant backup destination unavailable": "冗余备份目标不可用",
+    "redundant destination already holds a different file":
+        "冗余备份目标已存在内容不同的文件",
+    "resolve the conflicting file and copy again": "请先处理冲突文件，然后重新复制",
+    "redundant copy failed": "冗余备份复制失败",
     "Batch verification time": "统一校验耗时",
     "Starting file copy": "开始复制文件",
     "Starting second-source file copy": "开始复制第二个源的文件",
@@ -671,6 +680,7 @@ TRANSLATIONS: dict[str, str] = {
     "kept both": "两者都保留",
     "replaced": "已替换",
     "verified existing": "已校验的现有文件",
+    "written": "已写入",
     "verified clones": "已校验的克隆",
     "skipped": "已跳过",
     "failed": "失败",
@@ -814,6 +824,15 @@ def _em_dash_rule(match: re.Match[str]) -> str:
     return f"{left_zh or left} — {right_zh or right}"
 
 
+def _redundant_backup_line_rule(match: re.Match[str]) -> str:
+    """``<root>: 3 written, 1 skipped`` -> localised counter list."""
+    counts = []
+    for part in match.group(2).split(", "):
+        number, _, label = part.partition(" ")
+        counts.append(f"{number} {TRANSLATIONS.get(label, label)}")
+    return f"{match.group(1)}：{'，'.join(counts)}"
+
+
 _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
     # availability reason shown inside a combo box entry
     (
@@ -937,6 +956,21 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
     (
         r"^Continue the copy that was interrupted on (.+)\.$",
         lambda m: f"继续 {m.group(1)} 中断的复制。",
+    ),
+    # redundant backups (multi-destination mirroring) --------------------
+    (
+        r"^Redundant backups \((written in parallel|written one after another)\): "
+        r"(.*)$",
+        lambda m: (
+            "冗余备份（并行写入）：" if m.group(1) == "written in parallel"
+            else "冗余备份（顺序写入）："
+        )
+        + m.group(2),
+    ),
+    (
+        r"^(.+?): ((\d[\d,]*) (?:written|verified existing|skipped|failed)"
+        r"(?:, \d[\d,]* (?:written|verified existing|skipped|failed))*)$",
+        _redundant_backup_line_rule,
     ),
 ]
 

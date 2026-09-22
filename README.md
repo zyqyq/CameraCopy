@@ -19,6 +19,8 @@ cleanup, and guarded post-copy formatting.<br>
 - Optional embedded ratings and timestamps through ExifTool.
 - Optional copying of matching XMP and RapidRaw sidecars.
 - Existing-file handling: ask, skip, overwrite, or keep both.
+- Redundant backups: write every copied file to one or more extra folders, so a single
+  card ends up on several disks in one pass.
 - SHA-256 verification and temporary-file writes.
 - Resumable file copies: after a cancel, crash, or power failure the data that was
   already written is kept as a partial file and continued from that byte offset.
@@ -129,6 +131,35 @@ Recovery is stored in the per-user state directory next to the operation logs, n
 destination folder, and it is deleted as soon as the copy finishes successfully. Both
 behaviours can be turned off in **Settings** (**Resume interrupted file copies** on the
 Files tab and **Recover interrupted copy jobs** on the Advanced tab).
+
+### Redundant backups
+
+A copy normally writes each file once. Enable **Redundant backup** on the
+Source/Destination tab to write every copied file to one or more extra folders as well, so
+a single card is preserved on more than one disk in a single pass:
+
+1. In **Settings**, tick **Also write every copied file to the backup folders below**.
+2. Add each backup folder, for example the folder of a second external disk, and choose
+   whether they are written **at the same time** (parallel writes, faster) or **one after
+   another** (gentler on slow disks).
+3. Start the copy as usual. Dated folder names, and names changed by the collision policy,
+   are reproduced in every backup folder.
+
+Rules that keep the copy safe:
+
+- Every configured backup folder must be available and writable before the copy starts. If
+  one is missing, CameraCopy stops before writing anything and reports which folder failed.
+- A file that already exists in a backup folder is compared with the source by hash (or by
+  size when hashing is off). Identical files are verified and left untouched, so a repeated
+  run does not rewrite them.
+- When an existing backup copy differs, the collision policy decides. **Replace existing
+  files** and **Keep both** are honoured; **Always ask** and **Skip existing files** report
+  the file as a failure rather than silently overwriting or skipping it.
+- Source files are removed only after **every** backup folder holds the file. A failed
+  backup keeps the source, marks the file as failed, and warns before formatting the volume.
+
+The final summary lists each backup folder with how many files it received, verified, or
+failed to receive.
 
 
 ## Building

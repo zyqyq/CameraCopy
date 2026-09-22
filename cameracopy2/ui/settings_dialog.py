@@ -48,6 +48,7 @@ from cameracopy2.models import (
     CollisionPolicy,
     HashMethod,
     LanguageMode,
+    RedundantWriteMode,
     ThemeMode,
     VerificationMode,
     VolumeInfo,
@@ -65,7 +66,9 @@ from cameracopy2.ui.settings_widgets import (
     ColorPickerControl,
     FILE_PATTERN_PRESETS,
     FilePatternPreset,
+    FolderListEditor,
     PatternListEditor,
+    folder_identity,
 )
 from cameracopy2.ui.theme import preview_palette
 from cameracopy2.ui.tooltips import set_help_tooltip
@@ -392,10 +395,67 @@ class SettingsDialog(QDialog):
             destination_browse_button,
             "Choose the destination folder for copied files.",
         )
+
+        self.redundant_backup_checkbox = QCheckBox(
+            "Also write every copied file to the backup folders below"
+        )
+        self.redundant_backup_checkbox.setChecked(self._config.redundantbackup)
+        self.redundant_backup_checkbox.toggled.connect(self._update_redundant_controls)
+
+        self.redundant_folders_editor = FolderListEditor(
+            self._config.additionaldestinations,
+            placeholder="Example: /Volumes/Backup",
+            dialog_title="Choose a redundant backup folder",
+        )
+        self.redundant_folders_editor.changed.connect(self._update_redundant_controls)
+
+        self.redundant_write_mode_combo = QComboBox()
+        self.redundant_write_mode_combo.addItem(
+            "Write all backup folders at the same time", "parallel"
+        )
+        self.redundant_write_mode_combo.addItem(
+            "Write the backup folders one after another", "sequential"
+        )
+        self._set_combo_by_data(
+            self.redundant_write_mode_combo, self._config.redundantwritemode
+        )
+
+        form.addRow("Redundant backup:", self.redundant_backup_checkbox)
+        form.addRow("Backup folders:", self.redundant_folders_editor)
+        form.addRow("Backup writing:", self.redundant_write_mode_combo)
+        form.addHelpRow(
+            QLabel(
+                "Each copied file is also written to every backup folder, so a card ends "
+                "up on more than one disk. A backup folder that is missing or not "
+                "writable stops the copy before anything is written, and source files "
+                "are only removed once every folder holds the file."
+            )
+        )
+        set_form_row_tooltip(
+            form,
+            self.redundant_backup_checkbox,
+            "Write a second copy of every file to one or more extra folders.",
+            "Use this to keep a redundant copy on a second disk.",
+        )
+        set_form_row_tooltip(
+            form,
+            self.redundant_folders_editor,
+            "Extra folders that receive the same files as the destination.",
+            "Only available folders are used; a missing folder stops the copy.",
+            controls=(self.redundant_folders_editor,),
+        )
+        set_form_row_tooltip(
+            form,
+            self.redundant_write_mode_combo,
+            "Choose whether the backup folders are written at the same time.",
+            "Writing in parallel is faster; writing one after another is gentler on "
+            "slow disks.",
+        )
         form.finish()
         self.tabs.addTab(tab, "Source/Destination")
         self.source_edit.textChanged.connect(self._update_preview)
         self.destination_edit.textChanged.connect(self._update_preview)
+        self._update_redundant_controls()
 
     def _build_naming_tab(self) -> None:
         tab, layout = _create_form_tab()
@@ -1387,6 +1447,31 @@ class SettingsDialog(QDialog):
         if selected:
             self.destination_edit.setText(selected)
 
+    def _update_redundant_controls(self) -> None:
+        enabled = self.redundant_backup_checkbox.isChecked()
+        self.redundant_folders_editor.setEnabled(enabled)
+        self.redundant_write_mode_combo.setEnabled(enabled)
+
+    @staticmethod
+    def _redundant_backup_errors(config: CameraCopyConfig) -> list[str]:
+        if not config.redundantbackup:
+            return []
+        folders = [
+            str(folder).strip()
+            for folder in config.additionaldestinations
+            if str(folder).strip()
+        ]
+        if not folders:
+            return ["Add at least one redundant backup folder."]
+        destination_identity = folder_identity(config.destination)
+        errors: list[str] = []
+        for folder in folders:
+            if folder_identity(folder) == destination_identity:
+                errors.append(
+                    f"A redundant backup folder must differ from the destination: {folder}"
+                )
+        return errors
+
     def _browse_application_path(self) -> None:
         current = Path(self.application_path_edit.text()).expanduser()
         start_dir = current.parent if current.parent.exists() else Path.home()
@@ -1499,6 +1584,12 @@ class SettingsDialog(QDialog):
         return CameraCopyConfig(
             source=normalize_source_subfolder(self.source_edit.text()),
             destination=self.destination_edit.text().strip(),
+            redundantbackup=self.redundant_backup_checkbox.isChecked(),
+            additionaldestinations=self.redundant_folders_editor.values(),
+            redundantwritemode=cast(
+                RedundantWriteMode,
+                str(self.redundant_write_mode_combo.currentData() or "parallel"),
+            ),
             includedfiles=self.include_editor.values() or ["*"],
             excludedfiles=self.exclude_editor.values(),
             includeddevices=self.device_filter_editor.values(),
@@ -1609,6 +1700,7 @@ class SettingsDialog(QDialog):
             errors.append(source_error)
         if not config.destination:
             errors.append("Destination folder is required.")
+        errors.extend(self._redundant_backup_errors(config))
         if not config.includedfiles:
             errors.append("At least one include pattern is required.")
         for label, value in [

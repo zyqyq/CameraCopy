@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from cameracopy2.models import DEFAULT_INCLUDE_PATTERNS
 from cameracopy2.ui.tooltips import help_tooltip_text
@@ -10,6 +12,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QColorDialog,
+    QFileDialog,
     QHBoxLayout,
     QLineEdit,
     QListWidget,
@@ -139,6 +142,96 @@ class PatternListEditor(QWidget):
             for index in range(self.list_widget.count())
             if self.list_widget.item(index).text().strip()
         ]
+
+
+class FolderListEditor(QWidget):
+    """Editor for a list of folders, with a browse button for mounted disks."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        values: list[str] | None = None,
+        placeholder: str = "Example: /Volumes/Backup",
+        dialog_title: str = "Choose folder",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._dialog_title = dialog_title
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setMinimumHeight(84)
+        self.list_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.input = QLineEdit()
+        self.input.setPlaceholderText(placeholder)
+        browse_button = QPushButton("Browse…")
+        add_button = QPushButton("Add")
+        remove_button = QPushButton("Remove")
+
+        row = QHBoxLayout()
+        row.addWidget(self.input, 1)
+        row.addWidget(browse_button)
+        row.addWidget(add_button)
+        row.addWidget(remove_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.list_widget)
+        layout.addLayout(row)
+
+        add_button.clicked.connect(self.add_current)
+        browse_button.clicked.connect(self.browse)
+        remove_button.clicked.connect(self.remove_selected)
+        self.input.returnPressed.connect(self.add_current)
+        self.set_values(values or [])
+
+    def add_current(self) -> None:
+        self._add(self.input.text())
+
+    def browse(self) -> None:
+        start = self.input.text().strip() or str(Path.home())
+        selected = QFileDialog.getExistingDirectory(self, self._dialog_title, start)
+        if selected:
+            self._add(selected)
+
+    def remove_selected(self) -> None:
+        selected = self.list_widget.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            self.list_widget.takeItem(self.list_widget.row(item))
+        self.changed.emit()
+
+    def set_values(self, values: list[str] | tuple[str, ...]) -> None:
+        self.list_widget.clear()
+        for value in values:
+            cleaned = str(value).strip()
+            if cleaned:
+                self.list_widget.addItem(cleaned)
+
+    def values(self) -> list[str]:
+        return [
+            self.list_widget.item(index).text().strip()
+            for index in range(self.list_widget.count())
+            if self.list_widget.item(index).text().strip()
+        ]
+
+    def _add(self, value: str) -> None:
+        cleaned = str(value).strip()
+        if not cleaned:
+            return
+        existing = {folder_identity(item) for item in self.values()}
+        if folder_identity(cleaned) in existing:
+            return
+        self.list_widget.addItem(cleaned)
+        self.input.clear()
+        self.changed.emit()
+
+
+def folder_identity(value: str) -> str:
+    """Case-insensitive identity for a folder path, used to reject duplicates."""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(value))))
 
 
 class ColorPickerControl(QWidget):

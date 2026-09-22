@@ -5,10 +5,11 @@ import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Literal
 
 from cameracopy2.core.copy_messages import format_log_file_size, result_message
@@ -51,6 +52,7 @@ from cameracopy2.models import (
     CopyReport,
     FileCopyResult,
     HashResult,
+    ReplicaResult,
     VolumeInfo,
     VolumeMismatchDecision,
 )
@@ -90,6 +92,15 @@ def _source_stat_changed(before: os.stat_result, after: os.stat_result) -> bool:
         before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
     )
+
+
+def _replica_error_summary(replicas: list[ReplicaResult]) -> str:
+    """Render one ``<root>: <error>`` fragment per failed redundant destination."""
+    parts: list[str] = []
+    for replica in replicas:
+        detail = replica.error or replica.reason or "copy failed"
+        parts.append(f"{replica.root}: {detail}")
+    return "; ".join(parts)
 
 
 @dataclass(slots=True)
@@ -200,6 +211,11 @@ class CopyEngine:
         self._session_source_root: Path | None = None
         self._session_volume_key: str | None = None
         self._session_source_index = 0
+        # Redundant-backup destinations for the job currently running.
+        self._replica_roots: list[Path] = []
+        # Parallel replicas share the copy journal, so partial-file bookkeeping
+        # is serialised even though the file transfers themselves run at once.
+        self._partial_meta_lock = Lock()
         if rating_reader is None and timestamp_resolver is None:
             exiftool = ExifToolService()
             self.rating_reader = RatingReader(exiftool)
@@ -229,6 +245,7 @@ class CopyEngine:
         self._session_source_root = None
         self._session_volume_key = None
         self._session_source_index = 0
+        self._replica_roots = []
         volume_modes = self._volume_modes(job)
         clone_manifest: dict[str, CloneManifestEntry] | None = (
             {} if job.clone_mode and job.secondary else None
@@ -243,34 +260,51 @@ class CopyEngine:
         active_source = job.primary.mount_path
 
         try:
-            source_count = len(volume_modes)
-            for index, (volume, clone_mode) in enumerate(volume_modes, start=1):
-                active_source = volume.mount_path
-                if cancel_event.is_set():
-                    report.cancelled = True
-                    break
-                if index > 1:
-                    self._log(callbacks, report, "")
-
-                clone_role: CloneRole = "normal"
-                if clone_manifest is not None:
-                    clone_role = "secondary" if clone_mode else "primary"
-
-                self._run_volume(
-                    volume,
-                    job.config,
-                    job.autoremove,
+            root_error = self._prepare_redundant_roots(job.config, callbacks, report)
+            if root_error is not None:
+                # Refuse to start rather than copy onto a single disk and call it
+                # a redundant backup: the whole point of the feature is that
+                # every configured mirror is reachable.
+                self._emit_result(
                     callbacks,
                     report,
-                    cancel_event,
-                    clone_manifest=clone_manifest,
-                    clone_inventory=clone_inventory,
-                    clone_role=clone_role,
-                    source_index=index,
-                    source_count=source_count,
+                    FileCopyResult(
+                        source=active_source,
+                        destination=None,
+                        action="failed",
+                        reason="redundant backup destination unavailable",
+                        error=root_error,
+                    ),
                 )
+            else:
+                source_count = len(volume_modes)
+                for index, (volume, clone_mode) in enumerate(volume_modes, start=1):
+                    active_source = volume.mount_path
+                    if cancel_event.is_set():
+                        report.cancelled = True
+                        break
+                    if index > 1:
+                        self._log(callbacks, report, "")
 
-            self._run_batch_verification(callbacks, report, job, cancel_event)
+                    clone_role: CloneRole = "normal"
+                    if clone_manifest is not None:
+                        clone_role = "secondary" if clone_mode else "primary"
+
+                    self._run_volume(
+                        volume,
+                        job.config,
+                        job.autoremove,
+                        callbacks,
+                        report,
+                        cancel_event,
+                        clone_manifest=clone_manifest,
+                        clone_inventory=clone_inventory,
+                        clone_role=clone_role,
+                        source_index=index,
+                        source_count=source_count,
+                    )
+
+                self._run_batch_verification(callbacks, report, job, cancel_event)
         except Exception as exc:  # noqa: BLE001 - preserve completed copy results
             logger.exception("Unexpected copy-engine failure")
             result = FileCopyResult(
@@ -498,6 +532,8 @@ class CopyEngine:
             else "do not copy"
         )
         self._log(callbacks, report, f"Sidecars: {sidecar_policy}")
+        if job.config.redundantbackup:
+            self._log(callbacks, report, self._redundant_backup_log_line(job.config))
         if job.config.minrating > 0:
             self._log(callbacks, report, f"Minimum rating: {job.config.minrating}")
         cleanup = (
@@ -515,6 +551,22 @@ class CopyEngine:
             "rename": "Keep both",
         }
         return labels.get(policy, policy)
+
+    @staticmethod
+    def _redundant_backup_log_line(config: CameraCopyConfig) -> str:
+        roots = [
+            str(Path(raw).expanduser())
+            for raw in config.additionaldestinations
+            if str(raw).strip()
+        ]
+        if not roots:
+            return "Redundant backups: enabled, but no folder is configured"
+        mode = (
+            "written in parallel"
+            if config.redundantwritemode == "parallel"
+            else "written one after another"
+        )
+        return f"Redundant backups ({mode}): {' and '.join(roots)}"
 
     @staticmethod
     def _verification_label(config: CameraCopyConfig) -> str:
@@ -1690,6 +1742,247 @@ class CopyEngine:
             self._emit_result(callbacks, report, result)
         progress.finish_file(sidecar_size)
 
+    # -- redundant backups (mirroring one source to several destinations) ---
+    @staticmethod
+    def _resolved(text: str | Path) -> Path:
+        path = Path(text).expanduser()
+        try:
+            return path.resolve()
+        except OSError:
+            return path
+
+    def _prepare_redundant_roots(
+        self,
+        config: CameraCopyConfig,
+        callbacks: CopyCallbacks,
+        report: CopyReport,
+    ) -> str | None:
+        """Resolve the mirror roots for this job.
+
+        Returns ``None`` when the copy may proceed, or a description of every
+        unusable mirror root when the job has to be refused up front.
+        """
+        self._replica_roots = []
+        if not config.redundantbackup:
+            return None
+
+        seen: set[str] = {os.path.normcase(str(self._resolved(config.destination)))}
+        roots: list[Path] = []
+        problems: list[str] = []
+        for raw in config.additionaldestinations:
+            text = str(raw).strip()
+            if not text:
+                continue
+            root = self._resolved(text)
+            marker = os.path.normcase(str(root))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if not root.is_dir():
+                problems.append(f"{root} is not an available folder")
+                continue
+            if not os.access(root, os.W_OK):
+                problems.append(f"{root} is not writable")
+                continue
+            roots.append(root)
+
+        if problems:
+            return "; ".join(problems)
+        if not roots:
+            return "no redundant backup folder is configured"
+        self._replica_roots = roots
+        self._log(
+            callbacks,
+            report,
+            "Redundant backup destinations: " + ", ".join(str(root) for root in roots),
+        )
+        return None
+
+    def _replica_targets(
+        self, config: CameraCopyConfig, destination: Path
+    ) -> list[tuple[Path, Path]]:
+        """Map the primary destination onto each mirror root, dated folders included."""
+        primary_root = Path(config.destination).expanduser()
+        try:
+            relative = destination.relative_to(primary_root)
+        except ValueError:
+            relative = Path(destination.name)
+        return [(root, root / relative) for root in self._replica_roots]
+
+    def _mirror_to_replicas(
+        self,
+        *,
+        source: Path,
+        primary_destination: Path,
+        collision_policy: CollisionPolicy,
+        config: CameraCopyConfig,
+        cancel_event: Event,
+        file_index: int,
+    ) -> list[ReplicaResult]:
+        """Write one source file to every redundant destination root."""
+        if not self._replica_roots:
+            return []
+        targets = self._replica_targets(config, primary_destination)
+        if not targets:
+            return []
+        if config.redundantwritemode == "parallel" and len(targets) > 1:
+            with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+                futures = [
+                    executor.submit(
+                        self._write_replica,
+                        source=source,
+                        root=root,
+                        destination=destination,
+                        collision_policy=collision_policy,
+                        config=config,
+                        cancel_event=cancel_event,
+                        file_index=file_index,
+                    )
+                    for root, destination in targets
+                ]
+                return [future.result() for future in futures]
+        return [
+            self._write_replica(
+                source=source,
+                root=root,
+                destination=destination,
+                collision_policy=collision_policy,
+                config=config,
+                cancel_event=cancel_event,
+                file_index=file_index,
+            )
+            for root, destination in targets
+        ]
+
+    def _write_replica(
+        self,
+        *,
+        source: Path,
+        root: Path,
+        destination: Path,
+        collision_policy: CollisionPolicy,
+        config: CameraCopyConfig,
+        cancel_event: Event,
+        file_index: int,
+    ) -> ReplicaResult:
+        """Copy one file into one mirror root through the verified write path."""
+        copy_mode: CopyMode = "copied"
+        try:
+            if destination.exists():
+                matches = self._replica_matches_source(
+                    source, destination, config, cancel_event
+                )
+                if matches is None:
+                    return ReplicaResult(
+                        root=root,
+                        destination=destination,
+                        action="skipped",
+                        reason="copy cancelled",
+                    )
+                if matches:
+                    return ReplicaResult(
+                        root=root,
+                        destination=destination,
+                        action="verified_existing",
+                        copy_mode="verified_existing",
+                        hash_ok=True if config.checkhash else None,
+                    )
+                if collision_policy == "overwrite":
+                    copy_mode = "overwrote"
+                elif collision_policy == "rename":
+                    destination = self._unique_destination(destination)
+                    copy_mode = "renamed_copy"
+                else:
+                    # A prompt cannot be raised from a mirror: refusing loudly is
+                    # safer than silently dropping or clobbering user data.
+                    return ReplicaResult(
+                        root=root,
+                        destination=destination,
+                        action="failed",
+                        hash_ok=False if config.checkhash else None,
+                        reason="redundant destination already holds a different file",
+                        error="resolve the conflicting file and copy again",
+                    )
+
+            outcome = self._copy_to_destination(
+                source=source,
+                destination=destination,
+                checkhash=config.checkhash,
+                hash_method=config.hashmethod,
+                verify_after_copy=True,
+                durable_writes=config.durablewrites,
+                resume_partial=config.resumepartialfiles,
+                # Mirrors can run on worker threads, so their progress is not
+                # pushed through the UI callbacks from off the main thread.
+                callbacks=CopyCallbacks(),
+                cancel_event=cancel_event,
+                file_index=file_index,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ReplicaResult(
+                root=root,
+                destination=destination,
+                action="failed",
+                error=_friendly_exception_error(exc),
+            )
+
+        if outcome.cancelled:
+            return ReplicaResult(
+                root=root,
+                destination=destination,
+                action="skipped",
+                reason="copy cancelled",
+                bytes_copied=outcome.bytes_copied,
+            )
+        if not outcome.ok:
+            return ReplicaResult(
+                root=root,
+                destination=destination,
+                action="failed",
+                hash_ok=outcome.hash_ok,
+                reason="redundant copy failed",
+                error=outcome.error,
+                bytes_copied=outcome.bytes_copied,
+            )
+        return ReplicaResult(
+            root=root,
+            destination=destination,
+            action="copied",
+            copy_mode=copy_mode,
+            hash_ok=outcome.hash_ok,
+            bytes_copied=outcome.bytes_copied,
+        )
+
+    def _replica_matches_source(
+        self,
+        source: Path,
+        destination: Path,
+        config: CameraCopyConfig,
+        cancel_event: Event,
+    ) -> bool | None:
+        """Report whether an existing mirror file already holds the source bytes.
+
+        ``None`` means the comparison was cancelled.
+        """
+        try:
+            if source.stat().st_size != destination.stat().st_size:
+                return False
+        except OSError:
+            return False
+        if not config.checkhash:
+            return True
+        try:
+            outcome = self._compare_files(
+                source, destination, cancel_event, config.hashmethod
+            )
+        except Exception:  # noqa: BLE001 - an unreadable mirror is simply not a match
+            return False
+        if cancel_event.is_set() or outcome.error == "cancelled":
+            return None
+        if outcome.error:
+            return False
+        return outcome.ok
+
     def _copy_context(
         self,
         context: FileContext,
@@ -1798,6 +2091,16 @@ class CopyEngine:
             if copy_result.resumed_bytes:
                 report.partial_resume_count += 1
                 report.resumed_partial_bytes += copy_result.resumed_bytes
+            replicas = self._mirror_to_replicas(
+                source=source,
+                primary_destination=destination,
+                collision_policy=context.collision_policy,
+                config=config,
+                cancel_event=cancel_event,
+                file_index=file_index,
+            )
+            if any(replica.failed for replica in replicas):
+                report.add_format_risk("replica_failed", source)
             result = self._finalize_successful_copy(
                 context=context,
                 destination=destination,
@@ -1806,6 +2109,7 @@ class CopyEngine:
                 copy_mode=copy_mode,
                 hash_ok=copy_result.hash_ok,
                 defer_removal=defer_verification,
+                replicas=replicas,
             )
             if defer_verification and copy_result.source_digest is not None:
                 self._batch_entries.append(
@@ -1815,7 +2119,7 @@ class CopyEngine:
                         digest=copy_result.source_digest,
                         size_bytes=context.source_size,
                         result=result,
-                        remove_source=autoremove,
+                        remove_source=autoremove and not result.replicas_incomplete,
                         session_key=self._session_key(source) or "",
                     )
                 )
@@ -2299,8 +2603,24 @@ class CopyEngine:
         copy_mode: CopyMode,
         hash_ok: bool | None,
         defer_removal: bool = False,
+        replicas: list[ReplicaResult] | None = None,
     ) -> FileCopyResult:
-        if autoremove and not defer_removal:
+        replica_list = list(replicas or ())
+        replica_incomplete = [
+            replica for replica in replica_list if replica.failed or replica.skipped
+        ]
+        replica_failures = [replica for replica in replica_list if replica.failed]
+        incomplete_reason = "redundant backup incomplete" if replica_incomplete else None
+        incomplete_error = (
+            _replica_error_summary(replica_failures) if replica_failures else None
+        )
+
+        # A redundant backup is only worth the disk it occupies once every
+        # mirror holds the file, so the source stays until the mirrors agree.
+        if autoremove and not defer_removal and replica_incomplete:
+            incomplete_reason = "redundant backup incomplete; source kept"
+
+        if autoremove and not defer_removal and not replica_incomplete:
             remove_error = self._remove_source(context.source)
             if remove_error is not None:
                 return FileCopyResult(
@@ -2316,6 +2636,7 @@ class CopyEngine:
                     reason="source removal failed",
                     size_bytes=context.source_size,
                     bytes_copied=bytes_copied,
+                    replicas=replica_list,
                 )
             return FileCopyResult(
                 source=context.source,
@@ -2330,6 +2651,7 @@ class CopyEngine:
                 size_bytes=context.source_size,
                 bytes_copied=bytes_copied,
                 copy_mode=copy_mode,
+                replicas=replica_list,
             )
 
         return FileCopyResult(
@@ -2341,10 +2663,12 @@ class CopyEngine:
             timestamp=context.timestamp,
             timestamp_source=context.timestamp_source,
             rating_source=context.rating_source,
-            reason=None,
+            reason=incomplete_reason,
+            error=incomplete_error,
             size_bytes=context.source_size,
             bytes_copied=bytes_copied,
             copy_mode=copy_mode,
+            replicas=replica_list,
         )
 
     def _copy_to_destination(
@@ -2678,10 +3002,12 @@ class CopyEngine:
         if session is None or store is None:
             return
         data = partial_paths(destination).data
-        if keep:
-            store.add_partial(session, data)
-        else:
-            store.remove_partial(session, data)
+        # Parallel mirrors share one journal, so this bookkeeping is serialised.
+        with self._partial_meta_lock:
+            if keep:
+                store.add_partial(session, data)
+            else:
+                store.remove_partial(session, data)
 
     @staticmethod
     def _copy_failure_reason(

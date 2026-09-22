@@ -35,6 +35,10 @@ def format_risk_warning_paragraphs(
     if batch_failed:
         paragraphs.append(_batch_verification_warning(batch_failed))
 
+    replica_failed = counts.get("replica_failed", 0)
+    if replica_failed:
+        paragraphs.append(_replica_failed_warning(replica_failed))
+
     return paragraphs
 
 
@@ -123,4 +127,19 @@ def _batch_verification_warning(count: int) -> str:
         f"{count} copied files failed batch verification and do not match their "
         "sources.\n"
         "Those source files were kept and will be erased by formatting."
+    )
+
+
+def _replica_failed_warning(count: int) -> str:
+    if count == 1:
+        return (
+            "1 copied file is missing from at least one redundant backup folder.\n"
+            "It exists in only one place, so formatting this volume leaves it "
+            "without a second copy."
+        )
+    return (
+        f"{count} copied files are missing from at least one redundant backup "
+        "folder.\n"
+        "They exist in only one place, so formatting this volume leaves them "
+        "without a second copy."
     )

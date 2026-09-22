@@ -157,4 +157,6 @@ def _result_detail(result: FileCopyResult) -> str:
         and result.reason not in _ROUTINE_SKIP_REASONS
     ):
         parts.append(result.reason)
+    elif result.replicas_incomplete and result.reason:
+        parts.append(result.reason)
     return f" ({', '.join(parts)})"

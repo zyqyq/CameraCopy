@@ -121,6 +121,9 @@ class FakeMessageBox:
     def setWindowTitle(self, *args) -> None:  # noqa: ARG002
         pass
 
+    def setTextFormat(self, *args) -> None:  # noqa: ARG002
+        pass
+
     def setText(self, text: str) -> None:
         self.texts.append(text)
 
@@ -128,7 +131,9 @@ class FakeMessageBox:
         self.infos.append(text)
 
     def addButton(self, text: str, role) -> SimpleNamespace:
-        button = SimpleNamespace(text=text, role=role)
+        button = SimpleNamespace(
+            text=text, role=role, setStyleSheet=lambda *a, **k: None
+        )
         self.buttons.append(button)
         return button
 
@@ -175,40 +180,53 @@ def _dialog_with_pending(qapp, tmp_path: Path, source: Path):  # noqa: ARG001
 def test_dialog_deletes_only_after_confirmation(
     qapp, tmp_path: Path, fake_message_box
 ) -> None:
-    source = tmp_path / "DSC0001.JPG"
-    source.write_bytes(b"image")
-    dialog = _dialog_with_pending(qapp, tmp_path, source)
+    i18n.set_language("en")
+    try:
+        source = tmp_path / "DSC0001.JPG"
+        source.write_bytes(b"image")
+        dialog = _dialog_with_pending(qapp, tmp_path, source)
 
-    dialog._finish_all_operations()  # noqa: SLF001
-    dialog.close()
-    qapp.processEvents()
+        dialog._finish_all_operations()  # noqa: SLF001
+        dialog.close()
+        qapp.processEvents()
 
-    box = fake_message_box.last
-    assert box is not None, "a confirmation prompt must be shown"
-    assert "1 source file(s)" in box.texts[0]
-    assert not source.exists(), "confirming must delete the source file"
-    assert dialog.report.removal_confirmed is True
-    assert dialog.report.confirmed_removals == 1
-    log_text = dialog.log_view.toPlainText()
-    assert "Deleted 1 source file(s) after confirmation" in log_text
+        box = fake_message_box.last
+        assert box is not None, "a confirmation prompt must be shown"
+        assert "1 source file(s)" in box.texts[0]
+        # red, prominent warning + structured scope/reassurance lines
+        assert "#e53935" in box.infos[0]
+        assert "cannot be recovered" in box.infos[0]
+        assert "Only files that were copied and verified" in box.infos[0]
+        assert "The copies on the destination stay" in box.infos[0]
+        assert not source.exists(), "confirming must delete the source file"
+        assert dialog.report.removal_confirmed is True
+        assert dialog.report.confirmed_removals == 1
+        log_text = dialog.log_view.toPlainText()
+        assert "Deleted 1 source file(s) after confirmation" in log_text
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
 
 def test_dialog_keep_keeps_files(
     qapp, tmp_path: Path, fake_message_box
 ) -> None:
     fake_message_box.chosen_text = "Keep source files"
-    source = tmp_path / "DSC0001.JPG"
-    source.write_bytes(b"image")
-    dialog = _dialog_with_pending(qapp, tmp_path, source)
+    i18n.set_language("en")
+    try:
+        source = tmp_path / "DSC0001.JPG"
+        source.write_bytes(b"image")
+        dialog = _dialog_with_pending(qapp, tmp_path, source)
 
-    dialog._finish_all_operations()  # noqa: SLF001
-    dialog.close()
-    qapp.processEvents()
+        dialog._finish_all_operations()  # noqa: SLF001
+        dialog.close()
+        qapp.processEvents()
 
-    assert source.exists(), "declining must keep the source file"
-    assert dialog.report.removal_confirmed is False
-    log_text = dialog.log_view.toPlainText()
-    assert "Kept 1 source file(s); deletion cancelled." in log_text
+        assert source.exists(), "declining must keep the source file"
+        assert dialog.report.removal_confirmed is False
+        log_text = dialog.log_view.toPlainText()
+        assert "Kept 1 source file(s); deletion cancelled." in log_text
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
 
 def test_dialog_skips_prompt_without_pending(
@@ -243,6 +261,20 @@ def test_deletion_messages_follow_language() -> None:
                 "(1.5 MB) from the card?"
             )
             == "复制已成功完成。要从存储卡删除 3 个源文件（共 1.5 MB）吗？"
+        )
+        assert (
+            i18n.translate_text("Deleted files cannot be recovered.")
+            == "删除后无法恢复。"
+        )
+        assert (
+            i18n.translate_text(
+                "Only files that were copied and verified are affected."
+            )
+            == "仅影响已复制并校验通过的文件。"
+        )
+        assert (
+            i18n.translate_text("The copies on the destination stay.")
+            == "目标位置的副本不受影响。"
         )
         assert (
             i18n.translate_log("Kept 2 source file(s); deletion cancelled.")

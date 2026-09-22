@@ -805,9 +805,10 @@ TRANSLATIONS: dict[str, str] = {
     "Confirm source deletion": "确认删除源文件",
     "Delete source files": "删除源文件",
     "Keep source files": "保留源文件",
-    "Deleted files cannot be recovered. Only files that were copied and "
-    "verified are affected. The copies on the destination stay.":
-        "删除后无法恢复。只有已复制并校验通过的文件会被删除，目标位置的副本不受影响。",
+    "Deleted files cannot be recovered.": "删除后无法恢复。",
+    "Only files that were copied and verified are affected.":
+        "仅影响已复制并校验通过的文件。",
+    "The copies on the destination stay.": "目标位置的副本不受影响。",
     # --- Report export -----------------------------------------------------
     "Report": "报告",
     "Export report": "导出报告",

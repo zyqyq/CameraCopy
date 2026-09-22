@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from cameracopy2.core.copy_engine import BATCH_VERIFY_ACTION, remove_source_file
+from cameracopy2 import i18n
 from cameracopy2.core.format_warnings import (
     format_risk_warning_paragraphs,
     irreversible_format_warning,
@@ -799,20 +800,33 @@ class CopyProgressDialog(QDialog):
             return
         entries = list(report.pending_source_removals)
         total_bytes = sum(size for _path, size in entries)
+        size_text = format_log_file_size(total_bytes)
+        # Translate the pieces first, then assemble the rich text: the full
+        # HTML string must not go through the automatic setText interception
+        # (it would never match a TRANSLATIONS entry).
+        question = i18n.translate_text(
+            f"The copy finished successfully. Delete {len(entries)} source "
+            f"file(s) ({size_text}) from the card?"
+        )
+        warning = i18n.translate_text("Deleted files cannot be recovered.")
+        scope_note = i18n.translate_text(
+            "Only files that were copied and verified are affected."
+        )
+        copies_note = i18n.translate_text("The copies on the destination stay.")
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Confirm source deletion")
-        box.setText(
-            f"The copy finished successfully. Delete {len(entries)} source "
-            f"file(s) ({format_log_file_size(total_bytes)}) from the card?"
-        )
+        box.setWindowTitle(i18n.translate_text("Confirm source deletion"))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(f"<b>{question}</b>")
         box.setInformativeText(
-            "Deleted files cannot be recovered. Only files that were copied "
-            "and verified are affected. The copies on the destination stay."
+            f'<span style="color:#e53935;"><b>&#9888; {warning}</b></span><br>'
+            f"&bull; {scope_note}<br>"
+            f"&bull; {copies_note}"
         )
         delete_button = box.addButton(
             "Delete source files", QMessageBox.ButtonRole.AcceptRole
         )
+        delete_button.setStyleSheet("color:#c62828; font-weight:bold;")
         keep_button = box.addButton(
             "Keep source files", QMessageBox.ButtonRole.RejectRole
         )

@@ -433,3 +433,206 @@ def test_redundant_log_line_is_translated(tmp_path: Path) -> None:
         assert "冗余备份（并行写入）" in i18n.translate_log(start_lines[0])
     finally:
         i18n.set_language("en")
+
+
+# ---------------------------------------------------------------------------
+# Localisation of the redundant-backup user interface
+# ---------------------------------------------------------------------------
+
+REDUNDANT_UI_STRINGS = (
+    # settings dialog
+    "Redundant backup:",
+    "Also write every copied file to the backup folders below",
+    "Backup folders:",
+    "Backup writing:",
+    "Write all backup folders at the same time",
+    "Write the backup folders one after another",
+    "Choose a redundant backup folder",
+    "Write a second copy of every file to one or more extra folders.",
+    "Use this to keep a redundant copy on a second disk.",
+    "Extra folders that receive the same files as the destination.",
+    "Only available folders are used; a missing folder stops the copy.",
+    "Choose whether the backup folders are written at the same time.",
+    "Writing in parallel is faster; writing one after another is gentler on "
+    "slow disks.",
+    "Each copied file is also written to every backup folder, so a card ends "
+    "up on more than one disk. A backup folder that is missing or not "
+    "writable stops the copy before anything is written, and source files "
+    "are only removed once every folder holds the file.",
+    "Add at least one redundant backup folder.",
+    # main window
+    "Backup copies",
+    "Not enabled",
+    "No folder configured",
+    # dialogs
+    "Backup folders unavailable",
+    "The redundant backup cannot start because no backup folder is configured. "
+    "Add one in Settings or turn the redundant backup off.",
+    "The redundant backup cannot start because at least one backup folder is "
+    "unusable. Reconnect the disk, choose another folder, or turn the "
+    "redundant backup off in Settings.",
+    "same folder as the destination",
+    "folder is not available",
+    "folder is not writable",
+    # values composed at runtime
+    "/Volumes/A, /Volumes/B (at the same time)",
+    "/Volumes/A (one after another)",
+    "A redundant backup folder must differ from the destination: /Volumes/A",
+)
+
+
+@pytest.mark.parametrize("english", REDUNDANT_UI_STRINGS)
+def test_redundant_ui_strings_are_translated(english: str) -> None:
+    previous = i18n.get_language()
+    i18n.set_language("zh_CN")
+    try:
+        translated = i18n.translate_text(english)
+    finally:
+        i18n.set_language(previous)
+
+    assert translated != english
+    assert _contains_cjk(translated)
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= character <= "\u9fff" for character in text)
+
+
+def _gui_app():
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
+def test_settings_dialog_shows_the_redundant_backup_in_chinese(tmp_path: Path) -> None:
+    """The feature's own controls must be localised, not only its log lines."""
+    app = _gui_app()
+    from PySide6.QtWidgets import QLabel
+
+    previous = i18n.get_language()
+    i18n.set_language("zh_CN")
+    i18n.install(app)
+    try:
+        from cameracopy2.ui.settings_dialog import SettingsDialog
+
+        mirror = tmp_path / "backup-a"
+        mirror.mkdir()
+        config = CameraCopyConfig(
+            destination=str(tmp_path / "pictures"),
+            redundantbackup=True,
+            additionaldestinations=[str(mirror)],
+            redundantwritemode="sequential",
+        )
+        dialog = SettingsDialog(config, [])
+        app.processEvents()
+
+        assert _contains_cjk(dialog.redundant_backup_checkbox.text())
+        modes = [
+            dialog.redundant_write_mode_combo.itemText(index)
+            for index in range(dialog.redundant_write_mode_combo.count())
+        ]
+        assert modes and all(_contains_cjk(mode) for mode in modes)
+        assert _contains_cjk(dialog.redundant_backup_checkbox.toolTip())
+        assert _contains_cjk(dialog.redundant_folders_editor.toolTip())
+        assert _contains_cjk(dialog.redundant_write_mode_combo.toolTip())
+
+        labels = {label.text() for label in dialog.findChildren(QLabel)}
+        for english in (
+            "Redundant backup:",
+            "Backup folders:",
+            "Backup writing:",
+            "Each copied file is also written to every backup folder, so a card ends "
+            "up on more than one disk. A backup folder that is missing or not "
+            "writable stops the copy before anything is written, and source files "
+            "are only removed once every folder holds the file.",
+        ):
+            assert i18n.translate_text(english) in labels
+            assert english not in labels
+
+        dialog.close()
+    finally:
+        i18n.set_language(previous)
+
+
+def test_main_window_redundant_summary_is_chinese(tmp_path: Path) -> None:
+    app = _gui_app()
+    from PySide6.QtWidgets import QLabel
+
+    previous = i18n.get_language()
+    i18n.set_language("zh_CN")
+    i18n.install(app)
+    try:
+        from cameracopy2.ui.main_window import MainWindow
+
+        window = MainWindow(config_path=tmp_path / "cameracopy.json")
+        try:
+            window.config = CameraCopyConfig(
+                destination=str(tmp_path / "pictures"),
+                redundantbackup=True,
+                additionaldestinations=["/Volumes/Backup"],
+                redundantwritemode="sequential",
+            )
+            window._update_summaries()
+            window.show()
+            app.processEvents()
+
+            assert "备份副本：" in {label.text() for label in window.findChildren(QLabel)}
+            summary = "/Volumes/Backup (one after another)"
+            # the tooltip keeps the full value, so it is never elided
+            assert window.redundant_summary_label.toolTip() == i18n.translate_text(summary)
+            assert window.redundant_summary_label.text() == i18n.translate_text(summary)
+
+            window.config = CameraCopyConfig(destination=str(tmp_path / "pictures"))
+            window._update_summaries()
+            assert window.redundant_summary_label.text() == i18n.translate_text("Not enabled")
+
+            window.config = CameraCopyConfig(
+                destination=str(tmp_path / "pictures"), redundantbackup=True
+            )
+            window._update_summaries()
+            assert window.redundant_summary_label.text() == i18n.translate_text(
+                "No folder configured"
+            )
+        finally:
+            window.close()
+    finally:
+        i18n.set_language(previous)
+
+
+def test_elided_label_translates_before_eliding() -> None:
+    """Narrow labels must not fall back to English just because they elide."""
+    app = _gui_app()
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFontMetrics
+
+    from cameracopy2.ui.main_widgets import ElidedLabel
+
+    english = "/Volumes/BackupDiskAlpha/Photos (one after another)"
+    previous = i18n.get_language()
+    i18n.install(app)
+    try:
+        label = ElidedLabel(english)
+        metrics = QFontMetrics(label.font())
+
+        i18n.set_language("zh_CN")
+        translated = i18n.translate_text(english)
+        label.resize(120, 20)
+        label._apply_elide()
+        # the widget elides the localised text, keeps the English source
+        assert label.text() == metrics.elidedText(
+            translated, Qt.TextElideMode.ElideRight, 120
+        )
+        assert label.property("_i18n_text") == english
+
+        # wide enough for the localised value: it really is Chinese on screen
+        label.resize(metrics.horizontalAdvance(translated) + 4, 20)
+        label._apply_elide()
+        assert label.text() == translated
+        assert _contains_cjk(label.text())
+
+        i18n.set_language("en")
+        i18n.retranslate_all()
+        assert label.text() == english
+    finally:
+        i18n.set_language(previous)

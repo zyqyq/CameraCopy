@@ -385,6 +385,8 @@ TRANSLATIONS: dict[str, str] = {
     "Copy matching sidecars (.xmp, .rrdata)": "复制匹配的附属文件（.xmp、.rrdata）",
     "Skip existing files": "跳过已存在的文件",
     "Always ask": "总是询问",
+    "Ask what to do whenever a destination file already exists.":
+        "每当目标位置已存在同名文件时，询问要如何处理。",
     "Replace existing files": "替换已存在的文件",
     "Copy matching XMP and RapidRaw sidecars for selected media files.":
         "为选中的媒体文件复制匹配的 XMP 和 RapidRaw 附属文件。",
@@ -646,6 +648,47 @@ TRANSLATIONS: dict[str, str] = {
         "冗余备份目标已存在内容不同的文件",
     "resolve the conflicting file and copy again": "请先处理冲突文件，然后重新复制",
     "redundant copy failed": "冗余备份复制失败",
+    # -- redundant backup: settings dialog and main window -----------------
+    "Redundant backup:": "冗余备份：",
+    "Also write every copied file to the backup folders below":
+        "同时把每个复制文件写入下方的备份文件夹",
+    "Backup folders:": "备份文件夹：",
+    "Backup writing:": "备份写入方式：",
+    "Backup copies": "备份副本",
+    "Write all backup folders at the same time": "同时写入所有备份文件夹",
+    "Write the backup folders one after another": "依次写入各备份文件夹",
+    "at the same time": "同时写入",
+    "one after another": "依次写入",
+    "Not enabled": "未启用",
+    "No folder configured": "未配置文件夹",
+    "Choose a redundant backup folder": "选择冗余备份文件夹",
+    "Write a second copy of every file to one or more extra folders.":
+        "把每个文件的第二份副本写入一个或多个额外文件夹。",
+    "Use this to keep a redundant copy on a second disk.":
+        "用它可以在第二块磁盘上保留一份冗余副本。",
+    "Extra folders that receive the same files as the destination.":
+        "与目标位置接收相同文件的额外文件夹。",
+    "Only available folders are used; a missing folder stops the copy.":
+        "只使用当前可用的文件夹；文件夹缺失时会中止复制。",
+    "Choose whether the backup folders are written at the same time.":
+        "选择各备份文件夹是否同时写入。",
+    "Writing in parallel is faster; writing one after another is gentler on slow disks.":
+        "并行写入更快；依次写入对慢速磁盘更友好。",
+    "Each copied file is also written to every backup folder, so a card ends up on more than one disk. A backup folder that is missing or not writable stops the copy before anything is written, and source files are only removed once every folder holds the file.":
+        "每个复制文件也会写入所有备份文件夹，因此一张卡的数据会存放在不止一块磁盘上。"
+        "备份文件夹缺失或不可写时，复制会在写入任何内容之前中止；"
+        "只有所有备份文件夹都保存了该文件后，源文件才会被删除。",
+    "Add at least one redundant backup folder.": "请至少添加一个冗余备份文件夹。",
+    "Backup folders unavailable": "备份文件夹不可用",
+    "The redundant backup cannot start because no backup folder is configured. Add one in Settings or turn the redundant backup off.":
+        "冗余备份无法启动：尚未配置任何备份文件夹。"
+        "请在设置中添加一个备份文件夹，或关闭冗余备份。",
+    "The redundant backup cannot start because at least one backup folder is unusable. Reconnect the disk, choose another folder, or turn the redundant backup off in Settings.":
+        "冗余备份无法启动：至少有一个备份文件夹不可用。"
+        "请重新连接磁盘、更换文件夹，或在设置中关闭冗余备份。",
+    "same folder as the destination": "与目标文件夹相同",
+    "folder is not available": "文件夹不可用",
+    "folder is not writable": "文件夹不可写",
     "Batch verification time": "统一校验耗时",
     "Starting file copy": "开始复制文件",
     "Starting second-source file copy": "开始复制第二个源的文件",
@@ -841,6 +884,16 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
     ),
     # placeholder examples
     (r"^Example: (.+)$", lambda m: f"例如：{m.group(1)}"),
+    # redundant backup summary, e.g. "/Volumes/A, /Volumes/B (at the same time)"
+    (
+        r"^(.+) \((at the same time|one after another)\)$",
+        lambda m: f"{m.group(1)}（{TRANSLATIONS.get(m.group(2), m.group(2))}）",
+    ),
+    # settings validation: a backup folder may not be the destination itself
+    (
+        r"^A redundant backup folder must differ from the destination: (.+)$",
+        lambda m: f"冗余备份文件夹必须与目标位置不同：{m.group(1)}",
+    ),
     # "Finished with N failure(s)"
     (
         r"^Finished with (.+) failure\(s\)$",
@@ -1132,6 +1185,26 @@ def _source_of(widget: Any, key: str) -> str | None:
     except Exception:  # pragma: no cover
         return None
     return value if isinstance(value, str) and value else None
+
+
+def set_display_text(widget: Any, english: str, display: str) -> None:
+    """Show ``display`` while remembering ``english`` as the source text.
+
+    Widgets that post-process translated text before it reaches the screen --
+    eliding a value that is too wide, for example -- need this: the localised
+    string is what the user should see, but the English original has to stay on
+    the widget so :func:`retranslate_all` can rebuild the text when the user
+    switches language.
+    """
+    _store_source(widget, "text", english)
+    setter = _orig.get("label_setText")
+    try:
+        if setter is not None:
+            setter(widget, display)
+        else:  # pragma: no cover - patches not installed yet
+            widget.setText(display)
+    except Exception:  # pragma: no cover - never block the UI
+        pass
 
 
 def _install_patches() -> None:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from cameracopy2.models import DEFAULT_INCLUDE_PATTERNS
 from cameracopy2.ui.tooltips import help_tooltip_text
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QSize, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -102,6 +102,18 @@ class PatternListEditor(QWidget):
             self.list_widget.addItem(value)
             self.input.clear()
             self.changed.emit()
+
+    def sizeHint(self) -> QSize:
+        """Ask for the minimum height instead of the list's roomy default.
+
+        A bare QListWidget prefers 192 px of height, and with two of these
+        editors the Files tab claimed more height than the settings dialog
+        gave it. The tab was then squeezed and the list ended up drawn on top
+        of its own input row. The lists still expand when the tab has spare
+        height, they just no longer inflate the tab's preferred height.
+        """
+        hint = super().sizeHint()
+        return QSize(hint.width(), self.minimumSizeHint().height())
 
     def remove_selected(self) -> None:
         selected = self.list_widget.selectedItems()

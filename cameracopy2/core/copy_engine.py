@@ -23,7 +23,11 @@ from cameracopy2.core.hash import (
     sha256_file,
 )
 from cameracopy2.core.log_messages import classify_file_result, classify_log_message
-from cameracopy2.core.naming import build_destination_file
+from cameracopy2.core.naming import (
+    build_destination_file,
+    effective_rename_pattern,
+    rename_date_source_label,
+)
 from cameracopy2.core.rating_reader import RatingReader
 from cameracopy2.core.resume import (
     CopySession,
@@ -38,7 +42,7 @@ from cameracopy2.core.resume import (
 from cameracopy2.core.scanner import find_candidate_files
 from cameracopy2.core.sidecars import SidecarIndex, SidecarMatch, is_sidecar_path
 from cameracopy2.core.source_paths import resolve_source_root
-from cameracopy2.core.timestamp_resolver import TimestampResolver
+from cameracopy2.core.timestamp_resolver import RENAME_DATE_TAGS, TimestampResolver
 from cameracopy2.services.metadata_service import ExifToolService
 from cameracopy2.models import (
     CameraCopyConfig,
@@ -500,11 +504,21 @@ class CopyEngine:
         self._log(callbacks, report, f"Sidecars: {sidecar_policy}")
         if job.config.minrating > 0:
             self._log(callbacks, report, f"Minimum rating: {job.config.minrating}")
+        if job.config.renamefiles:
+            self._log(callbacks, report, f"Rename files: {self._rename_summary(job.config)}")
         cleanup = (
             "remove after successful copy" if job.autoremove else "leave source files in place"
         )
         self._log(callbacks, report, f"Source cleanup: {cleanup}")
         self._log(callbacks, report, "")
+
+    @staticmethod
+    def _rename_summary(config: CameraCopyConfig) -> str:
+        """One log line describing the active rename scheme."""
+        return (
+            f"{effective_rename_pattern(config)} "
+            f"(date from {rename_date_source_label(config.renamefiledatesource)})"
+        )
 
     @staticmethod
     def _collision_policy_label(policy: CollisionPolicy) -> str:
@@ -2145,17 +2159,28 @@ class CopyEngine:
     def _warm_metadata_cache(
         self, files: list[Path], config: CameraCopyConfig, cancel_event: Event
     ) -> None:
-        if not config.useembeddedmetadata:
+        if not config.useembeddedmetadata and not self._rename_needs_metadata(config):
             return
         warmed_services: set[int] = set()
-        if config.minrating > 0:
+        if config.useembeddedmetadata and config.minrating > 0:
             self.rating_reader.warm_cache(files, cancel_event=cancel_event)
             warmed_services.add(id(self.rating_reader.exiftool))
-        if (
-            self._date_folder_enabled(config)
-            and id(self.timestamp_resolver.exiftool) not in warmed_services
-        ):
+        if id(self.timestamp_resolver.exiftool) in warmed_services:
+            return
+        if self._rename_needs_metadata(config):
+            self.timestamp_resolver.warm_rename_cache(
+                files, config.renamefiledatesource, cancel_event=cancel_event
+            )
+        elif self._date_folder_enabled(config):
             self.timestamp_resolver.warm_cache(files, cancel_event=cancel_event)
+
+    @staticmethod
+    def _rename_needs_metadata(config: CameraCopyConfig) -> bool:
+        """True when the chosen rename date can only come from ExifTool."""
+        return bool(
+            config.renamefiles
+            and RENAME_DATE_TAGS.get(str(config.renamefiledatesource or ""))
+        )
 
     def _build_file_context(
         self,
@@ -2171,7 +2196,12 @@ class CopyEngine:
         else:
             rating, rating_source = None, None
         timestamp, timestamp_source = self._resolve_timestamp(source, config, sidecars)
-        destination = build_destination_file(config, source, timestamp)
+        destination = build_destination_file(
+            config,
+            source,
+            timestamp,
+            self._resolve_rename_date(source, config, timestamp),
+        )
         return FileContext(
             source=source,
             destination=destination,
@@ -2213,6 +2243,22 @@ class CopyEngine:
             use_embedded_metadata=config.useembeddedmetadata,
             sidecars=sidecars,
         )
+
+    def _resolve_rename_date(
+        self,
+        source: Path,
+        config: CameraCopyConfig,
+        folder_timestamp: datetime,
+    ) -> datetime | None:
+        """Date used in the target file name, or None while renaming is off."""
+        if not config.renamefiles:
+            return None
+        rename_date, _source = self.timestamp_resolver.resolve_rename_date(
+            source,
+            config.renamefiledatesource,
+            fallback=folder_timestamp,
+        )
+        return rename_date
 
     @staticmethod
     def _build_sidecar_map(

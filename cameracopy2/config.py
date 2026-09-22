@@ -17,6 +17,7 @@ from .models import (
     HashMethod,
     LanguageMode,
     RedundantWriteMode,
+    RenameDateSource,
     ThemeMode,
     VerificationMode,
     VolumeMatch,
@@ -179,6 +180,16 @@ def config_from_dict(data: Any) -> CameraCopyConfig:
         folderprefix=_read_str(data, "folderprefix", default.folderprefix),
         datetimestring=_read_str(data, "datetimestring", default.datetimestring),
         folderpostfix=_read_str(data, "folderpostfix", default.folderpostfix),
+        renamefiles=_read_bool(data, "renamefiles", default.renamefiles),
+        renamefileprefix=_read_str(data, "renamefileprefix", default.renamefileprefix),
+        renamefiledatestring=_read_str(
+            data, "renamefiledatestring", default.renamefiledatestring
+        ),
+        renamefilepostfix=_read_str(data, "renamefilepostfix", default.renamefilepostfix),
+        renamefilepattern=_read_str(data, "renamefilepattern", default.renamefilepattern),
+        renamefiledatesource=_read_rename_date_source(
+            data, default.renamefiledatesource
+        ),
         defaultprimaryvolumeid=_read_str(
             data, "defaultprimaryvolumeid", default.defaultprimaryvolumeid
         ),
@@ -444,6 +455,32 @@ def _read_verification_mode(data: dict[str, Any], default: VerificationMode) -> 
     return cast(VerificationMode, value)
 
 
+_ALLOWED_RENAME_DATE_SOURCES = frozenset(
+    {
+        "same_as_folder",
+        "exif_datetime_original",
+        "exif_create_date",
+        "quicktime_create_date",
+        "xmp_create_date",
+        "file_mtime",
+    }
+)
+
+
+def _read_rename_date_source(
+    data: dict[str, Any], default: RenameDateSource
+) -> RenameDateSource:
+    if "renamefiledatesource" not in data:
+        return default
+    value = data["renamefiledatesource"]
+    if not isinstance(value, str) or value not in _ALLOWED_RENAME_DATE_SOURCES:
+        raise UnsupportedConfigError(
+            "renamefiledatesource must be same_as_folder, exif_datetime_original, "
+            "exif_create_date, quicktime_create_date, xmp_create_date or file_mtime."
+        )
+    return cast(RenameDateSource, value)
+
+
 def _read_optional_color(
     data: dict[str, Any], key: str, default: str | None
 ) -> str | None:
@@ -499,4 +536,21 @@ def validate_folder_component(component: str) -> str | None:
     base_name = component.split(".", 1)[0]
     if _WINDOWS_RESERVED_FOLDER_NAMES.fullmatch(base_name):
         return "Folder name is reserved by Windows."
+    return None
+
+
+def validate_file_stem(stem: str) -> str | None:
+    """Return an error for a generated file stem that Windows would reject.
+
+    The stem has no extension, so unlike a folder name there is nothing to
+    strip before the reserved-name check.
+    """
+    if not stem:
+        return None
+    if _INVALID_FOLDER_CHARS.search(stem):
+        return "File name contains characters that are invalid on Windows."
+    if stem.endswith((" ", ".")):
+        return "File name must not end with a space or period on Windows."
+    if _WINDOWS_RESERVED_FOLDER_NAMES.fullmatch(stem):
+        return "File name is reserved by Windows."
     return None

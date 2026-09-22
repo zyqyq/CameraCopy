@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 import sys
@@ -41,13 +42,21 @@ from cameracopy2.config import (
 from cameracopy2.core.log_messages import LogMessageType
 from cameracopy2.core.hash import hash_method_available
 from cameracopy2.core.metadata_diagnostics import diagnose_files, format_diagnostics_report
-from cameracopy2.core.naming import preview_destination
+from cameracopy2.core.naming import (
+    RENAME_DATE_SOURCE_ORDER,
+    RENAME_PATTERN_DEFAULT,
+    RENAME_PATTERN_TOKENS,
+    build_renamed_file_name,
+    preview_destination,
+    rename_date_source_label,
+)
 from cameracopy2.core.source_paths import resolve_source_root
 from cameracopy2.models import (
     CameraCopyConfig,
     CollisionPolicy,
     HashMethod,
     LanguageMode,
+    RenameDateSource,
     ThemeMode,
     VerificationMode,
     VolumeInfo,
@@ -88,6 +97,31 @@ DATE_PRESETS = [
     ("Custom", None),
 ]
 
+#: Renamed files usually want the time of day too, so these presets are more
+#: granular than the folder ones.
+FILE_DATE_PRESETS = [
+    ("20260509_143005", "yyyyMMdd_HHmmss"),
+    ("20260509-143005", "yyyyMMdd-HHmmss"),
+    ("2026-05-09_14-30-05", "yyyy-MM-dd_HH-mm-ss"),
+    ("20260509", "yyyyMMdd"),
+    ("2026-05-09", "yyyy-MM-dd"),
+    ("No date", ""),
+    ("Custom", None),
+]
+
+
+def _preset_index(presets: list[tuple[str, str | None]], value: str) -> int:
+    """Combo index of ``value``, falling back to the Custom entry."""
+    return next(
+        (index for index, (_, item) in enumerate(presets) if item == value),
+        len(presets) - 1,
+    )
+
+
+def _combo_index(combo: QComboBox, value: object) -> int:
+    index = combo.findData(value)
+    return index if index >= 0 else 0
+
 _HASH_METHOD_HELP = (
     "SHA-256: most compatible — any tool can re-check it, which suits long-term "
     "archives; slower because it is CPU-bound.\n"
@@ -110,7 +144,10 @@ _VERIFY_MODE_HELP: dict[str, str] = {
 
 # Height the dialog spends on the tab bar, the preview label, the button row
 # and the layout margins, on top of the tab content itself.
-_DIALOG_CHROME_HEIGHT = 150
+_DIALOG_CHROME_HEIGHT = 170
+
+#: Sample name used by the preview lines and the metadata diagnostics report.
+PREVIEW_FILE_NAME = "DSC0001.ARW"
 
 
 class _CompactForm(QWidget):
@@ -281,7 +318,6 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self._build_source_tab()
         self._build_naming_tab()
-        self._build_metadata_tab()
         self._build_copy_tab()
         self._build_device_tab()
         self._build_appearance_tab()
@@ -399,64 +435,7 @@ class SettingsDialog(QDialog):
 
     def _build_naming_tab(self) -> None:
         tab, layout = _create_form_tab()
-        self.prefix_edit = QLineEdit(self._config.folderprefix)
-        self.postfix_edit = QLineEdit(self._config.folderpostfix)
-        self.date_preset_combo = QComboBox()
-        self.custom_date_edit = QLineEdit(self._config.datetimestring)
-        for label, value in DATE_PRESETS:
-            self.date_preset_combo.addItem(label, value)
-        preset_index = next(
-            (
-                i
-                for i, (_, value) in enumerate(DATE_PRESETS)
-                if value == self._config.datetimestring
-            ),
-            len(DATE_PRESETS) - 1,
-        )
-        self.date_preset_combo.setCurrentIndex(preset_index)
-        self.custom_date_edit.setEnabled(self.date_preset_combo.currentData() is None)
 
-        layout.addRow("Folder prefix:", self.prefix_edit)
-        layout.addRow("Date format:", self.date_preset_combo)
-        layout.addRow("Custom date format:", self.custom_date_edit)
-        layout.addRow("Folder postfix:", self.postfix_edit)
-        set_form_row_tooltip(
-            layout,
-            self.prefix_edit,
-            "Text added before the date in each destination folder name.",
-        )
-        set_form_row_tooltip(
-            layout,
-            self.date_preset_combo,
-            "Choose how the capture date is formatted in destination folder names.",
-        )
-        set_form_row_tooltip(
-            layout,
-            self.custom_date_edit,
-            "Enter a custom date pattern, such as yyyy-MM-dd.",
-            "Used only when Custom is selected.",
-        )
-        set_form_row_tooltip(
-            layout,
-            self.postfix_edit,
-            "Text added after the date in each destination folder name.",
-        )
-
-        help_label = QLabel(
-            "Common date presets are shown as examples. Custom formats use the CameraCopy "
-            "date format, for example yyyy-MM-dd."
-        )
-        layout.addHelpRow(help_label)
-        layout.finish()
-        self.tabs.addTab(tab, "Folder naming")
-
-        self.prefix_edit.textChanged.connect(self._update_preview)
-        self.postfix_edit.textChanged.connect(self._update_preview)
-        self.custom_date_edit.textChanged.connect(self._update_preview)
-        self.date_preset_combo.currentIndexChanged.connect(self._date_preset_changed)
-
-    def _build_metadata_tab(self) -> None:
-        tab, layout = _create_form_tab()
         self.rating_combo = QComboBox()
         for label, value in [
             ("Off", 0),
@@ -496,10 +475,10 @@ class SettingsDialog(QDialog):
             "only use supported Adobe XMP and .rrdata sidecar ratings. Files without a "
             "supported rating sidecar will be treated as unrated."
         )
-
         self.metadata_diagnostics_button = QPushButton("Run metadata diagnostics")
         self.metadata_diagnostics_button.clicked.connect(self._run_metadata_diagnostics)
 
+        layout.addRow("Rating and metadata")
         layout.addRow("Minimum rating:", self.rating_combo)
         layout.addHelpRow(self.rating_help_label)
         layout.addHelpRow(self.rating_warning_label)
@@ -507,6 +486,64 @@ class SettingsDialog(QDialog):
         layout.addRow("Embedded metadata:", self.embedded_metadata_checkbox)
         layout.addRow("External metadata tool:", self.exiftool_status_label)
         layout.addRow("Diagnostics:", self.metadata_diagnostics_button)
+
+        self.prefix_edit = QLineEdit(self._config.folderprefix)
+        self.postfix_edit = QLineEdit(self._config.folderpostfix)
+        self.date_preset_combo = QComboBox()
+        self.custom_date_edit = QLineEdit(self._config.datetimestring)
+        for label, value in DATE_PRESETS:
+            self.date_preset_combo.addItem(label, value)
+        self.date_preset_combo.setCurrentIndex(
+            _preset_index(DATE_PRESETS, str(self._config.datetimestring))
+        )
+        self.custom_date_edit.setEnabled(self.date_preset_combo.currentData() is None)
+
+        layout.addRow("Folder naming")
+        layout.addRow("Folder prefix:", self.prefix_edit)
+        layout.addRow("Date format:", self.date_preset_combo)
+        layout.addRow("Custom date format:", self.custom_date_edit)
+        layout.addRow("Folder postfix:", self.postfix_edit)
+
+        self.rename_prefix_edit = QLineEdit(self._config.renamefileprefix)
+        self.rename_postfix_edit = QLineEdit(self._config.renamefilepostfix)
+        self.rename_date_source_combo = QComboBox()
+        for source in RENAME_DATE_SOURCE_ORDER:
+            self.rename_date_source_combo.addItem(
+                rename_date_source_label(source), source
+            )
+        self.rename_date_source_combo.setCurrentIndex(
+            _combo_index(self.rename_date_source_combo, self._config.renamefiledatesource)
+        )
+        self.rename_date_preset_combo = QComboBox()
+        for label, value in FILE_DATE_PRESETS:
+            self.rename_date_preset_combo.addItem(label, value)
+        self.rename_date_preset_combo.setCurrentIndex(
+            _preset_index(FILE_DATE_PRESETS, str(self._config.renamefiledatestring))
+        )
+        self.rename_custom_date_edit = QLineEdit(self._config.renamefiledatestring)
+        self.rename_custom_date_edit.setEnabled(
+            self.rename_date_preset_combo.currentData() is None
+        )
+        self.rename_pattern_edit = QLineEdit(self._config.renamefilepattern)
+        self.rename_pattern_edit.setPlaceholderText(RENAME_PATTERN_DEFAULT)
+
+        rename_help_label = QLabel(
+            "Used when “Rename files from metadata” is enabled on the main window. "
+            "The extension is kept. Leave the pattern empty to use prefix + date + "
+            "postfix, or combine tokens for your own scheme: "
+            + ", ".join(f"{{{name}}}" for name in RENAME_PATTERN_TOKENS)
+            + ". * means the original name, so \u201c{date}-*\u201d keeps it after the date."
+        )
+
+        layout.addRow("File renaming")
+        layout.addRow("File prefix:", self.rename_prefix_edit)
+        layout.addRow("Date source:", self.rename_date_source_combo)
+        layout.addRow("Date format:", self.rename_date_preset_combo)
+        layout.addRow("Custom date format:", self.rename_custom_date_edit)
+        layout.addRow("File postfix:", self.rename_postfix_edit)
+        layout.addRow("File name pattern:", self.rename_pattern_edit)
+        layout.addHelpRow(rename_help_label)
+
         set_form_row_tooltip(
             layout,
             self.rating_combo,
@@ -542,10 +579,89 @@ class SettingsDialog(QDialog):
             "timestamp candidates and folder date CameraCopy would choose. Files and "
             "settings are not changed.",
         )
+        set_form_row_tooltip(
+            layout,
+            self.prefix_edit,
+            "Text added before the date in each destination folder name.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.date_preset_combo,
+            "Choose how the capture date is formatted in destination folder names.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.custom_date_edit,
+            "Enter a custom date pattern, such as yyyy-MM-dd.",
+            "Used only when Custom is selected.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.postfix_edit,
+            "Text added after the date in each destination folder name.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_prefix_edit,
+            "Text added before the date in each renamed file name.",
+            "Only used while the pattern is left empty.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_date_source_combo,
+            "Which date the renamed file name is built from.",
+            "Pick a specific EXIF, QuickTime or XMP field, keep the folder date, or use "
+            "the file modified time. When the chosen field is missing, CameraCopy falls "
+            "back to the folder date so the file is still renamed.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_date_preset_combo,
+            "Choose how the date is formatted in renamed file names.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_custom_date_edit,
+            "Enter a custom date pattern, such as yyyyMMdd_HHmmss.",
+            "Used only when Custom is selected.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_postfix_edit,
+            "Text added after the date in each renamed file name.",
+            "Only used while the pattern is left empty.",
+        )
+        set_form_row_tooltip(
+            layout,
+            self.rename_pattern_edit,
+            "Rebuild the whole file name from tokens.",
+            "Working with the pattern replaces prefix and postfix. Example: "
+            "{date}-{name} turns DJI0001.MP4 into 20260101-DJI0001.MP4.",
+            controls=(rename_help_label,),
+        )
+
+        help_label = QLabel(
+            "Common date presets are shown as examples. Custom formats use the CameraCopy "
+            "date format, for example yyyy-MM-dd."
+        )
+        layout.addHelpRow(help_label)
         layout.finish()
-        self.tabs.addTab(tab, "Metadata")
+        self.tabs.addTab(tab, "Naming and metadata")
+
         self.rating_combo.currentIndexChanged.connect(self._refresh_inline_warnings)
         self.embedded_metadata_checkbox.toggled.connect(self._refresh_inline_warnings)
+        self.prefix_edit.textChanged.connect(self._update_preview)
+        self.postfix_edit.textChanged.connect(self._update_preview)
+        self.custom_date_edit.textChanged.connect(self._update_preview)
+        self.date_preset_combo.currentIndexChanged.connect(self._date_preset_changed)
+        self.rename_prefix_edit.textChanged.connect(self._update_preview)
+        self.rename_postfix_edit.textChanged.connect(self._update_preview)
+        self.rename_custom_date_edit.textChanged.connect(self._update_preview)
+        self.rename_pattern_edit.textChanged.connect(self._update_preview)
+        self.rename_date_preset_combo.currentIndexChanged.connect(
+            self._rename_date_preset_changed
+        )
+        self.rename_date_source_combo.currentIndexChanged.connect(self._update_preview)
 
     def _run_metadata_diagnostics(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1378,6 +1494,15 @@ class SettingsDialog(QDialog):
             self.custom_date_edit.setText(str(self.date_preset_combo.currentData() or ""))
         self._update_preview()
 
+    def _rename_date_preset_changed(self) -> None:
+        custom = self.rename_date_preset_combo.currentData() is None
+        self.rename_custom_date_edit.setEnabled(custom)
+        if not custom:
+            self.rename_custom_date_edit.setText(
+                str(self.rename_date_preset_combo.currentData() or "")
+            )
+        self._update_preview()
+
     def _browse_destination(self) -> None:
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -1493,6 +1618,12 @@ class SettingsDialog(QDialog):
             date_format = self.custom_date_edit.text().strip()
         else:
             date_format = str(self.date_preset_combo.currentData() or "")
+        if self.rename_date_preset_combo.currentData() is None:
+            rename_date_format_value = self.rename_custom_date_edit.text().strip()
+        else:
+            rename_date_format_value = str(
+                self.rename_date_preset_combo.currentData() or ""
+            )
         primary_id, secondary_id = self._selected_device_ids()
         primary_match, secondary_match = self._selected_device_matches()
         collision_policy = cast(CollisionPolicy, str(self.collision_combo.currentData()))
@@ -1505,6 +1636,15 @@ class SettingsDialog(QDialog):
             folderprefix=self.prefix_edit.text(),
             datetimestring=date_format,
             folderpostfix=self.postfix_edit.text(),
+            renamefiles=self._config.renamefiles,
+            renamefileprefix=self.rename_prefix_edit.text(),
+            renamefiledatestring=rename_date_format_value,
+            renamefilepostfix=self.rename_postfix_edit.text(),
+            renamefilepattern=self.rename_pattern_edit.text().strip(),
+            renamefiledatesource=cast(
+                RenameDateSource,
+                str(self.rename_date_source_combo.currentData() or "same_as_folder"),
+            ),
             defaultprimaryvolumeid=primary_id,
             defaultsecondaryvolumeid=secondary_id,
             defaultprimaryvolumematch=primary_match,
@@ -1547,11 +1687,29 @@ class SettingsDialog(QDialog):
             config = self._config_from_controls()
             source_example = self._preview_source(config)
             destination_example = preview_destination(config)
-            self.preview_label.setText(
-                f"Source example: {source_example}\nDestination example: {destination_example}"
-            )
+            lines = [
+                f"Source example: {source_example}",
+                f"Destination example: {destination_example}",
+            ]
+            rename_example = self._preview_rename(config, destination_example)
+            if rename_example:
+                lines.append(f"Rename example (when enabled): {rename_example}")
+            self.preview_label.setText("\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             self.preview_label.setText(f"Preview unavailable: {exc}")
+
+    def _preview_rename(self, config: CameraCopyConfig, destination_example: str) -> str:
+        """Preview the built file name even while the switch on the main window is off."""
+        sample = Path(PREVIEW_FILE_NAME)
+        try:
+            name = build_renamed_file_name(
+                config, sample, datetime.now().replace(microsecond=0)
+            )
+        except ValueError as exc:
+            return f"unavailable — {exc}"
+        if name == sample.name:
+            return ""
+        return str(Path(destination_example).parent / name)
 
     def _preview_source(self, config: CameraCopyConfig) -> str:
         preview_volume = self._preview_volume()

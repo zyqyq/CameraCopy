@@ -735,6 +735,58 @@ TRANSLATIONS: dict[str, str] = {
     "Interrupted copy stopped; it can be resumed later.":
         "中断的复制已停止，之后可以继续。",
     "Bytes continued from partial files": "断点续传已写入的字节",
+    # ------------------------------------------------------------------
+    # Metadata-based file renaming (main window + Naming and metadata tab)
+    # ------------------------------------------------------------------
+    "Rename files from metadata": "根据元数据重命名文件",
+    "File renaming:": "文件重命名：",
+    "File renaming": "文件重命名",
+    "Rating and metadata": "评分与元数据",
+    "Naming and metadata": "命名与元数据",
+    "File prefix:": "文件前缀：",
+    "File postfix:": "文件后缀：",
+    "Date source:": "日期来源：",
+    "File name pattern:": "文件名通配模式：",
+    "No date": "不含日期",
+    "Same as folder date": "与文件夹日期相同",
+    "EXIF DateTimeOriginal": "EXIF DateTimeOriginal（拍摄时间）",
+    "EXIF CreateDate": "EXIF CreateDate（创建时间）",
+    "QuickTime CreateDate": "QuickTime CreateDate（创建时间）",
+    "XMP CreateDate": "XMP CreateDate（创建时间）",
+    "File modified time": "文件修改时间",
+    "Rename copied files from their capture metadata.":
+        "根据拍摄元数据重命名复制后的文件。",
+    "Configure the naming rules in Settings on the Naming and metadata tab.":
+        "命名规则请在「设置」的「命名与元数据」页中配置。",
+    "Text added before the date in each renamed file name.":
+        "添加在每个重命名文件名中日期之前的文字。",
+    "Text added after the date in each renamed file name.":
+        "添加在每个重命名文件名中日期之后的文字。",
+    "Only used while the pattern is left empty.": "仅在通配模式留空时使用。",
+    "Which date the renamed file name is built from.":
+        "重命名后的文件名使用哪个日期。",
+    "Pick a specific EXIF, QuickTime or XMP field, keep the folder date, or use "
+    "the file modified time. When the chosen field is missing, CameraCopy falls "
+    "back to the folder date so the file is still renamed.":
+        "可选择具体的 EXIF、QuickTime 或 XMP 字段，沿用文件夹日期，或使用文件修改时间。"
+        "所选字段缺失时，CameraCopy 会退回文件夹日期，文件仍会被重命名。",
+    "Choose how the date is formatted in renamed file names.":
+        "选择重命名文件名中日期的格式。",
+    "Enter a custom date pattern, such as yyyyMMdd_HHmmss.":
+        "输入自定义日期格式，例如 yyyyMMdd_HHmmss。",
+    "Rebuild the whole file name from tokens.":
+        "用占位符重新组合整个文件名。",
+    "Working with the pattern replaces prefix and postfix. Example: "
+    "{date}-{name} turns DJI0001.MP4 into 20260101-DJI0001.MP4.":
+        "填写通配模式后将忽略前缀和后缀。例：{date}-{name} 会把 "
+        "DJI0001.MP4 重命名为 20260101-DJI0001.MP4。",
+    # File stem validation messages (mirrors the folder-name wording)
+    "File name contains characters that are invalid on Windows.":
+        "文件名包含 Windows 不允许的字符。",
+    "File name must not end with a space or period on Windows.":
+        "文件名在 Windows 上不能以空格或句点结尾。",
+    "File name is reserved by Windows.": "文件名是 Windows 保留名。",
+    "The rename pattern produced an empty file name.": "重命名模式生成了空文件名。",
 }
 
 
@@ -937,6 +989,44 @@ _PATTERN_SOURCES: list[tuple[str, RuleFn]] = [
     (
         r"^Continue the copy that was interrupted on (.+)\.$",
         lambda m: f"继续 {m.group(1)} 中断的复制。",
+    ),
+    # Metadata-based file renaming
+    (
+        r"^Rename files: (.+) \(date from (.+)\)$",
+        lambda m: (
+            f"重命名文件：{TRANSLATIONS.get(m.group(1), m.group(1))}"
+            f"（日期来自 {TRANSLATIONS.get(m.group(2), m.group(2))}）"
+        ),
+    ),
+    (
+        r"^Rename example \(when enabled\): unavailable — (.+)$",
+        lambda m: f"重命名示例（启用后）：不可用 — {translate(m.group(1))}",
+    ),
+    (
+        r"^Rename example \(when enabled\): (.+)$",
+        lambda m: f"重命名示例（启用后）：{m.group(1)}",
+    ),
+    (
+        r"^Invalid destination file name (.+?): (.+)$",
+        lambda m: (
+            f"目标文件名无效 {m.group(1)}：{TRANSLATIONS.get(m.group(2), m.group(2))}"
+        ),
+    ),
+    (
+        r"^Unknown rename token \{([A-Za-z0-9_]*)\}\. Supported tokens: (.+) and \*\.$",
+        lambda m: f"未知的重命名占位符 {{{m.group(1)}}}。可用的占位符：{m.group(2)} 和 *。",
+    ),
+    (
+        r"^Used when “Rename files from metadata” is enabled on the main window\. "
+        r"The extension is kept\. Leave the pattern empty to use prefix \+ date \+ "
+        r"postfix, or combine tokens for your own scheme: (.+?)\. \* means the "
+        r"original name, so “(.+?)” keeps it after the date\.$",
+        lambda m: (
+            "在主窗口勾选「根据元数据重命名文件」后生效。扩展名始终保留。"
+            "通配模式留空时使用「文件前缀 + 日期 + 文件后缀」组合，也可以用这些"
+            f"占位符自由组合：{m.group(1)}。* 代表原始文件名，"
+            f"例如「{m.group(2)}」会把原文件名放在日期后面。"
+        ),
     ),
 ]
 

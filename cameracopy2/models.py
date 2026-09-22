@@ -66,6 +66,16 @@ VolumeMatchMethod = Literal[
     "device_path",
     "mount_point",
 ]
+#: Where the date used to rename a copied file comes from. ``same_as_folder``
+#: reuses the folder-naming chain so both names always agree.
+RenameDateSource = Literal[
+    "same_as_folder",
+    "exif_datetime_original",
+    "exif_create_date",
+    "quicktime_create_date",
+    "xmp_create_date",
+    "file_mtime",
+]
 CollisionDecision = Literal["skip", "overwrite", "rename", "cancel"]
 CloneMismatchDecision = Literal["keep_both", "replace", "skip", "cancel"]
 VolumeMismatchDecision = Literal[
@@ -119,6 +129,12 @@ class CameraCopyConfig:
     folderprefix: str = ""
     datetimestring: str = "yyyy-MM-dd"
     folderpostfix: str = ""
+    renamefiles: bool = False
+    renamefileprefix: str = ""
+    renamefiledatestring: str = "yyyyMMdd_HHmmss"
+    renamefilepostfix: str = ""
+    renamefilepattern: str = ""
+    renamefiledatesource: RenameDateSource = "same_as_folder"
     defaultprimaryvolumeid: str = ""
     defaultsecondaryvolumeid: str = ""
     defaultprimaryvolumematch: VolumeMatch = field(default_factory=VolumeMatch)

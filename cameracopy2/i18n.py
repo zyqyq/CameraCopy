@@ -933,6 +933,29 @@ TRANSLATIONS: dict[str, str] = {
         "文件名在 Windows 上不能以空格或句点结尾。",
     "File name is reserved by Windows.": "文件名是 Windows 保留名。",
     "The rename pattern produced an empty file name.": "重命名模式生成了空文件名。",
+    # -- settings bundle (export / import) ---------------------------------
+    "Export…": "导出…",
+    "Import…": "导入…",
+    "Export settings": "导出设置",
+    "Import settings": "导入设置",
+    "Settings exported": "设置已导出",
+    "Settings export failed": "设置导出失败",
+    "Settings imported": "设置已导入",
+    "Settings import failed": "设置导入失败",
+    "All settings were written to:": "所有设置已写入：",
+    "Replace every setting in this dialog with the ones from:":
+        "用以下文件中的设置替换本对话框中的全部设置：",
+    "Settings were loaded into this dialog. Review them and click Save to apply.":
+        "设置已载入本对话框。请检查后点击「保存」使其生效。",
+    "Write every setting to a JSON file you can keep, share, or move to "
+    "another machine.":
+        "把所有设置写入一个 JSON 文件，便于保存、分享或迁移到另一台电脑。",
+    "Load every setting from a CameraCopy settings file into this dialog.":
+        "从 CameraCopy 设置文件把所有设置载入本对话框。",
+    "Settings written by a newer version keep their unknown fields so "
+    "exporting again does not lose them. Click Save to apply.":
+        "较新版本写入的设置会保留本版本不认识的字段，再次导出时不会丢失。"
+        "点击「保存」使其生效。",
 }
 
 

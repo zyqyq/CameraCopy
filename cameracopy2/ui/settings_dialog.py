@@ -4,7 +4,7 @@ from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 import sys
-from typing import cast
+from typing import Any, cast
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -40,6 +40,13 @@ from cameracopy2.config import (
     normalize_source_subfolder,
     validate_folder_component,
     validate_relative_source,
+)
+from cameracopy2.config_bundle import (
+    BUNDLE_FILE_FILTER,
+    BUNDLE_SUFFIX,
+    SettingsBundleError,
+    export_settings_file,
+    load_settings_file,
 )
 from cameracopy2.core.log_messages import LogMessageType
 from cameracopy2.core.hash import hash_method_available
@@ -326,6 +333,8 @@ class SettingsDialog(QDialog):
         self._config = config
         self._all_volumes = list(volumes or [])
         self._volumes = self._filter_volumes(self._config.includeddevices)
+        #: Bundle data from a newer version, re-emitted on the next export.
+        self._preserved: dict[str, dict[str, Any]] = {"settings": {}, "extra": {}}
         self._sample_cache_key: tuple[str, tuple[str, ...], tuple[str, ...]] | None = None
         self._sample_cache_value: Path | None = None
 
@@ -357,6 +366,30 @@ class SettingsDialog(QDialog):
         )
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
+
+        self.export_settings_button = buttons.addButton(
+            "Export…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        # addButton() creates the button inside Qt, so the translation patch
+        # never sees the initial label; set it again through the patched setter.
+        self.export_settings_button.setText("Export…")
+        self.export_settings_button.clicked.connect(self._export_settings_file)
+        set_help_tooltip(
+            self.export_settings_button,
+            "Write every setting to a JSON file you can keep, share, or move to "
+            "another machine.",
+        )
+        self.import_settings_button = buttons.addButton(
+            "Import…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.import_settings_button.setText("Import…")
+        self.import_settings_button.clicked.connect(self._import_settings_file)
+        set_help_tooltip(
+            self.import_settings_button,
+            "Load every setting from a CameraCopy settings file into this dialog.",
+            "Settings written by a newer version keep their unknown fields so "
+            "exporting again does not lose them. Click Save to apply.",
+        )
 
         self.version_label = QLabel(__version__)
         self.version_label.setEnabled(False)
@@ -391,6 +424,109 @@ class SettingsDialog(QDialog):
         if screen is not None:
             wanted = min(wanted, screen.availableGeometry().height() - 80)
         return max(560, wanted)
+
+    # -- settings bundle (export / import) ---------------------------------
+    def _current_controls_config(self) -> CameraCopyConfig:
+        """Config shown by the dialog controls, falling back to the saved one."""
+        try:
+            return self._config_from_controls()
+        except Exception:  # noqa: BLE001 - half-edited dialog still exports
+            return self._config
+
+    def _export_settings_file(self) -> None:
+        # Static QMessageBox/QFileDialog helpers run inside Qt, so they bypass
+        # the translation patch and are translated here on purpose.
+        config = self._current_controls_config()
+        suggested = Path.home() / f"cameracopy-settings{BUNDLE_SUFFIX}"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            i18n.translate_text("Export settings"),
+            str(suggested),
+            BUNDLE_FILE_FILTER,
+        )
+        if not path:
+            return
+        try:
+            written = export_settings_file(config, path, preserved=self._preserved)
+        except (SettingsBundleError, OSError) as exc:
+            QMessageBox.critical(
+                self, i18n.translate_text("Settings export failed"), str(exc)
+            )
+            return
+        QMessageBox.information(
+            self,
+            i18n.translate_text("Settings exported"),
+            f"{i18n.translate_text('All settings were written to:')}\n{written}",
+        )
+
+    def _import_settings_file(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            i18n.translate_text("Import settings"),
+            str(Path.home()),
+            BUNDLE_FILE_FILTER,
+        )
+        if not path:
+            return
+        try:
+            bundle = load_settings_file(path)
+        except SettingsBundleError as exc:
+            QMessageBox.critical(
+                self, i18n.translate_text("Settings import failed"), str(exc)
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            i18n.translate_text("Import settings"),
+            f"{i18n.translate_text('Replace every setting in this dialog with the ones from:')}"
+            f"\n{path}\n\n{bundle.describe()}",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._apply_config(bundle.config, preserved=bundle.preserved)
+        QMessageBox.information(
+            self,
+            i18n.translate_text("Settings imported"),
+            i18n.translate_text(
+                "Settings were loaded into this dialog. "
+                "Review them and click Save to apply."
+            ),
+        )
+
+    def _apply_config(
+        self,
+        config: CameraCopyConfig,
+        *,
+        preserved: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Load ``config`` into the dialog by rebuilding every tab page."""
+        self._config = config
+        if preserved is not None:
+            self._preserved = preserved
+        self._volumes = self._filter_volumes(config.includeddevices)
+        self._sample_cache_key = None
+        self._sample_cache_value = None
+        self._rebuild_tabs()
+
+    def _rebuild_tabs(self) -> None:
+        """Recreate all tab pages so every control reflects the current config."""
+        old = self.tabs
+        self.tabs = QTabWidget()
+        self._build_source_tab()
+        self._build_naming_tab()
+        self._build_copy_tab()
+        self._build_device_tab()
+        self._build_appearance_tab()
+        # Report must be built before Advanced (see __init__).
+        self._build_report_tab()
+        self._build_advanced_tab()
+        self._refresh_inline_warnings()
+        layout = self.layout()
+        if layout is not None:
+            layout.replaceWidget(old, self.tabs)
+        old.setParent(None)
+        old.deleteLater()
+        self._update_preview()
 
     def _build_source_tab(self) -> None:
         tab, form = _create_form_tab()

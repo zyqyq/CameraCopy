@@ -876,16 +876,25 @@ class CopyProgressDialog(QDialog):
             report.add_log(failure_line)
             self.append_log(failure_line, "ERROR")
 
+    def _preferred_report_format(self) -> str:
+        """First usable configured report format, falling back to CSV."""
+        config = self.job.config
+        for file_format in config.reportformats or ():
+            if file_format in {"csv", "html", "pdf"}:
+                return file_format
+        return "csv"
+
     def export_report_dialog(self) -> None:
         """Ask for a location and export the finished report manually."""
         report = self.report
         if report is None:
             return
         config = self.job.config
+        preferred = self._preferred_report_format()
         directory = resolve_report_directory(config, report)
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            suggested = build_export_path(directory, report, config.reportformat)
+            suggested = build_export_path(directory, report, preferred)
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Report export failed: {exc}", "ERROR")
             return
@@ -899,7 +908,7 @@ class CopyProgressDialog(QDialog):
             return
         suffix = Path(chosen).suffix.lower().lstrip(".")
         if suffix not in {"csv", "html", "pdf"}:
-            chosen = str(Path(chosen).with_suffix(f".{config.reportformats[0]}"))
+            chosen = str(Path(chosen).with_suffix(f".{preferred}"))
         self._export_report(Path(chosen))
 
     def _auto_export_report(self) -> None:
@@ -929,7 +938,7 @@ class CopyProgressDialog(QDialog):
         config = self.job.config
         options = ReportExportOptions(
             file_format=output_path.suffix.lower().lstrip(".")
-            or config.reportformats[0],
+            or self._preferred_report_format(),
             fields=list(config.reportfields),
             include_summary=config.reportincludesummary,
             include_log=config.reportincludelog,
